@@ -424,9 +424,10 @@ async fn handle(
         (Method::POST, "/api/play-pause") => {
             let body = read_json(req).await.unwrap_or(serde_json::Value::Null);
             let want_play = body.get("playing").and_then(serde_json::Value::as_bool);
-            let playing = !state.is_playing_snapshot();
+            let playing = state.is_playing_snapshot();
             match want_play {
-                // Explicit desired state, so a retried request can't double-toggle.
+                // Explicit desired state, so a retried request cannot double-toggle. Only toggle
+                // when the player is not already where the caller wants it.
                 Some(true) if !playing => state.resume_or_toggle().await,
                 Some(false) if playing => state.resume_or_toggle().await,
                 Some(_) => {}
