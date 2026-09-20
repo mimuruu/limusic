@@ -251,6 +251,37 @@ Windows and macOS instructions live in [docs/BUILD-PLATFORMS.md](docs/BUILD-PLAT
 
 ---
 
+## Keeping this fork up to date
+
+This fork carries the Phone remote feature, so pulling upstream's latest is a *merge*, not a
+`git pull`: their commits and ours have to meet, and upstream touching a file this fork also
+touched is where that gets interesting. The feature lives in its own files (`remote.rs`,
+`remote-android/`), so most of the time it merges cleanly — upstream's changes to `lib.rs`,
+`commands.rs` and `Cargo.toml` are additions at different points from ours.
+
+`update-limusic.ps1` (next to this repo, launched by `Update Limusic.bat`) does the safe version:
+backs up the current state to a `backup-phone-remote` branch, fetches, shows what is about to
+happen and which of our files upstream also touched, merges, and — if there *is* a conflict —
+aborts and puts everything back rather than leaving a half-merged tree.
+
+By hand, it is:
+
+```bash
+git branch -f backup-phone-remote master   # keep a way back
+git fetch origin
+git log --oneline master..origin/master    # what upstream added
+git merge origin/master
+# conflict? then:
+git merge --abort
+git checkout backup-phone-remote
+```
+
+After a clean merge, rebuild: `cargo tauri build`. If `ui/package.json` changed, run
+`cd ui && pnpm install` first — `cargo tauri build` runs the frontend build itself, but not the
+dependency install.
+
+---
+
 ## How It Works, Briefly
 
 - A pure Rust crate speaks YouTube's InnerTube API, impersonating several
