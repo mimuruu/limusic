@@ -17,6 +17,7 @@ mod media;
 mod mini;
 mod orchestrator;
 mod potoken;
+mod remote;
 mod session;
 mod state;
 #[cfg(target_os = "windows")]
@@ -430,6 +431,16 @@ pub fn run() {
                 tracing::warn!(error = %e, "tray init failed (continuing without tray)");
             }
 
+            // Phone remote (remote.rs): a LAN HTTP API so the Android app can drive playback.
+            // Off unless the user turned it on, because it is the one part of this app that
+            // listens on the network rather than loopback. A failed bind costs the feature, not
+            // the app, so it is logged rather than propagated (matches videoproxy).
+            if app_state.db.get_setting("remote_enabled").as_deref() == Some("true") {
+                if let Err(e) = remote::start(handle.clone()) {
+                    tracing::warn!(error = %e, "phone remote failed to start");
+                }
+            }
+
             // A custom app icon (#173) has to be pushed at each surface every launch, since only
             // the .exe/.desktop icon is baked in and that one we can't touch. Guarded, rather than
             // unconditional: with no custom icon there is nothing to restore, and on Windows
@@ -703,6 +714,10 @@ pub fn run() {
             commands::diagnostics_summary,
             commands::save_diagnostics,
             commands::log_ui,
+            commands::remote_info,
+            commands::remote_set_enabled,
+            commands::remote_new_pairing_code,
+            commands::remote_revoke_device,
         ])
         .on_window_event(|window, event| {
             // Close-to-tray: ✕ hides the main window and playback keeps running; real quit is

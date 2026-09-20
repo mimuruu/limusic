@@ -264,6 +264,8 @@
 			"general_hint": "History, integrations and how the app starts.",
 			"discord": "Discord",
 			"discord_hint": "How your Rich Presence card looks.",
+			"remote": "Phone remote",
+			"remote_hint": "Control playback from your phone over the local network.",
 			"themes": "Appearance",
 			"themes_hint": "Colors, fonts and the player view.",
 			"playback": "Playback",
@@ -394,6 +396,23 @@
 			"clear_cache": "Clear image and stream cache",
 			"clear_cache_hint": "Frees up disk space by clearing cached thumbnails and audio chunks.",
 			"clear_cache_button": "Clear cache now"
+		},
+		"remote": {
+			"enable": "Phone remote",
+			"enable_hint": "Let a paired phone on this network control playback. Anyone who reaches this address and has a paired token can skip, seek and play music, so leave it off on networks you do not trust.",
+			"port": "Port",
+			"apply": "Apply",
+			"address": "Address for your phone",
+			"address_hint": "Open the remote app on your phone and enter this address. Both devices must be on the same network.",
+			"no_address": "No local network address was found. Connect this computer to WiFi or Ethernet, then reopen this tab.",
+			"pair": "Pair a phone",
+			"pair_hint": "Show a one-time code, then enter it in the app on your phone. The code works once and expires in a few minutes.",
+			"new_code": "New code",
+			"expires_in": "Expires in {seconds}s",
+			"devices": "Paired devices",
+			"no_devices": "No phones are paired yet.",
+			"revoke": "Revoke this device",
+			"revoked": "Device revoked."
 		},
 		"about": {
 			"description": "A beautiful, fast, and lightweight desktop music player powered by Tauri and Svelte.",

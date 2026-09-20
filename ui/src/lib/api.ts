@@ -387,6 +387,29 @@ export const setSetting = (key: string, value: string) =>
 export const getStreamClients = () => invoke<string[]>('get_stream_clients');
 /** Wipe both cache tiers (URL cache + mpv on-disk audio cache). */
 export const clearCaches = () => invoke<void>('clear_caches');
+// --- phone remote (remote.rs) --------------------------------------------------------------
+export interface RemoteDevice {
+	id: number;
+	name: string;
+	pairedAt: number;
+}
+export interface RemoteInfo {
+	enabled: boolean;
+	port: number;
+	addresses: string[];
+	devices: RemoteDevice[];
+}
+/** Whether the LAN listener is up, where the phone should point, and who is paired. */
+export const remoteInfo = () => invoke<RemoteInfo>('remote_info');
+/** Turn the LAN listener on or off, optionally moving the port first. */
+export const remoteSetEnabled = (enabled: boolean, port?: number) =>
+	invoke<RemoteInfo>('remote_set_enabled', { enabled, port: port ?? null });
+/** Mint a fresh pairing code (single-use, expires in a few minutes). */
+export const remoteNewPairingCode = () =>
+	invoke<{ code: string; expiresInSeconds: number }>('remote_new_pairing_code');
+/** Forget one paired device; its token stops working immediately. */
+export const remoteRevokeDevice = (id: number) => invoke<RemoteInfo>('remote_revoke_device', { id });
+
 /** Set the app icon to a PNG the user picked, or restore the bundled one with `null` (#173). */
 export const setAppIcon = (path: string | null) => invoke<void>('set_app_icon', { path });
 /** Path to the custom app icon, granted to the asset protocol. `null` when the bundled one is in use. */

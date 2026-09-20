@@ -190,7 +190,7 @@ pub async fn get_queue(state: St<'_>) -> Result<serde_json::Value, String> {
 /// `visitor_data`) and internal blobs (`queue_json`, `queue_index`, `queue_position`) never cross
 /// into the webview: they'd otherwise ship the login credential to the renderer on every open, and
 /// the webview can't overwrite them either.
-const UI_SETTINGS: [&str; 19] = [
+const UI_SETTINGS: [&str; 21] = [
     "volume",
     "proxy",
     "quality",
@@ -210,6 +210,8 @@ const UI_SETTINGS: [&str; 19] = [
     "system_titlebar",
     "lastfm_primary_artist",
     "lastfm_primary_strict",
+    "remote_enabled",
+    "remote_port",
 ];
 
 /// Resolve the music video for `video_id` and hand back a `limusicvideo://` URL the player view
@@ -1659,6 +1661,64 @@ pub fn theater_fullscreen(window: tauri::WebviewWindow, on: bool) -> Result<(), 
             })
             .map_err(|e| e.to_string())
     }
+}
+
+// --- phone remote (remote.rs) ----------------------------------------------------------------
+
+/// Everything the remote settings panel draws: whether it is listening, the port, the LAN URLs to
+/// type into the phone, and the paired devices. No token or hash crosses this boundary.
+#[tauri::command]
+pub async fn remote_info(state: St<'_>) -> Result<serde_json::Value, String> {
+    Ok(crate::remote::status(&state.db))
+}
+
+/// Turn the LAN listener on or off. Persisted first, so a restart comes back the way the user left
+/// it; then applied. Binding a port already in use is the one expected failure, and it is reported
+/// rather than swallowed: the setting stays on and the UI shows the error, so the user can pick a
+/// different port instead of silently having nothing listening.
+#[tauri::command]
+pub async fn remote_set_enabled(
+    app: tauri::AppHandle,
+    state: St<'_>,
+    enabled: bool,
+    port: Option<u16>,
+) -> Result<serde_json::Value, String> {
+    if let Some(port) = port.filter(|p| *p >= 1024) {
+        state.db.set_setting("remote_port", &port.to_string());
+    }
+    if enabled {
+        // Restart on a port change: `start` is a no-op while a server is up, and the port may
+        // have just moved.
+        crate::remote::stop();
+        state.db.set_setting("remote_enabled", "true");
+        match crate::remote::start(app) {
+            Ok(_) => {}
+            Err(e) => return Err(e),
+        }
+    } else {
+        crate::remote::stop();
+        state.db.set_setting("remote_enabled", "false");
+    }
+    Ok(crate::remote::status(&state.db))
+}
+
+/// Mint a fresh pairing code for the panel to show. A code with no listener behind it would pair
+/// nothing, so this requires the remote to be on.
+#[tauri::command]
+pub async fn remote_new_pairing_code(state: St<'_>) -> Result<serde_json::Value, String> {
+    if !crate::remote::status(&state.db)["enabled"].as_bool().unwrap_or(false) {
+        return Err("Turn the phone remote on first.".into());
+    }
+    let (code, ttl) = crate::remote::new_pairing_code();
+    Ok(serde_json::json!({ "code": code, "expiresInSeconds": ttl }))
+}
+
+/// Revoke a paired phone. Its token stops working on the next request; the row is gone from the
+/// list the panel draws.
+#[tauri::command]
+pub async fn remote_revoke_device(state: St<'_>, id: usize) -> Result<serde_json::Value, String> {
+    crate::remote::revoke_device(id, &state.db);
+    Ok(crate::remote::status(&state.db))
 }
 
 #[cfg(test)]

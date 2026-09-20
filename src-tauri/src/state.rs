@@ -2143,6 +2143,14 @@ impl AppState {
         f64::from_bits(self.latest_position.load(Ordering::SeqCst))
     }
 
+    /// Whether mpv is currently playing. Public read of the same private mirror
+    /// `playback_snapshot` reports as `paused`, for callers outside this module that need the raw
+    /// flag: the phone remote uses it to turn an idempotent "play"/"pause" request into the right
+    /// toggle instead of flipping the state blindly.
+    pub fn is_playing_snapshot(&self) -> bool {
+        self.is_playing.load(Ordering::Relaxed)
+    }
+
     /// Advance/rewind the queue (OS "next"/"previous" keys + the UI's skip buttons). `play_index`
     /// itself no-ops for guests.
     pub async fn next_in_queue(self: &std::sync::Arc<Self>) {
