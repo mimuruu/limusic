@@ -1,0 +1,29 @@
+name: limusic_remote
+description: "Remote control for Limusic (desktop YouTube Music client) over the local network."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.13.4
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+
+  # HTTP client for the Limusic remote API. `http` is the smallest thing that does the job: this
+  # app speaks plain JSON over the LAN, with no streaming, retries or interceptors to configure.
+  http: ^1.2.2
+  # Server address + device token survive app restarts, so pairing happens once.
+  shared_preferences: ^2.3.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
