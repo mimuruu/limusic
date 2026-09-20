@@ -6,6 +6,19 @@
 
 **A native desktop YouTube Music client. Rust + Tauri, ad-free, no Electron.**
 
+> ### About this fork
+>
+> This is a fork of [SimoHypers/limusic](https://github.com/SimoHypers/limusic) that adds a
+> **Phone remote**: control playback from an Android phone on the same WiFi, the way Spotify
+> Connect works. Upstream does not have this feature.
+>
+> * `src-tauri/src/remote.rs` — the LAN HTTP API, with device pairing
+> * `remote-android/` — the Android app that talks to it
+> * Settings → **Phone remote** — turn it on, pair a phone, revoke a device
+>
+> Everything else is upstream's work. Licenced GPL-3.0, same as the original.
+> See [Phone remote](#phone-remote) below.
+
 <p align="center">
   <a href="https://github.com/SimoHypers/limusic/releases/latest"><img alt="GitHub Downloads" src="https://img.shields.io/github/downloads/SimoHypers/limusic/total?style=for-the-badge&label=DOWNLOADS&color=a4c400"></a>
   <a href="https://github.com/SimoHypers/limusic/releases/latest"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/SimoHypers/limusic?display_name=release&style=for-the-badge&color=a10935"></a>
@@ -142,6 +155,42 @@ Note that YouTube Music's lyrics are licensed per region and are missing
 entirely in some countries. Where that's the case, LRCLIB does all the work.
 
 ---
+
+## Phone remote
+
+Control playback from an Android phone on the same WiFi — play/pause, skip, seek, volume, shuffle,
+repeat, the queue and YouTube Music search — without walking back to the keyboard.
+
+**Not a Spotify Connect clone in one respect:** there is no cloud relay and no account involved. The
+phone talks straight to this machine over the LAN, and this machine plays the music.
+
+### Using it
+
+1. **Settings → Phone remote**, turn it on. The panel shows the address to type into the phone.
+2. Press **New code** for a one-time 6-digit pairing code (valid 5 minutes).
+3. On the phone, open the app from [`remote-android/`](remote-android), enter the address, press
+   **Check connection**, then enter the code.
+
+Paired phones are listed with a revoke button each. Build the app with `flutter build apk`; see
+[`remote-android/README.md`](remote-android/README.md).
+
+### Security
+
+The listener binds `0.0.0.0`, so the token is the whole boundary, and it is treated as one:
+
+- pairing needs the code shown on the desktop; it is single-use, expires in 5 minutes, and is
+  compared in constant time;
+- each phone gets its own token, stored as a SHA-256 digest — a copied `settings` table yields no
+  usable credential;
+- the API can play music and nothing else. It cannot read the Google session, change settings, or
+  reach auth;
+- **the remote is off by default.** Leave it off on networks you do not trust: anyone who reaches
+  the address *and* holds a paired token can control playback.
+
+It speaks plain HTTP by design. On a home LAN a self-signed certificate buys a phone warning rather
+than privacy, and the token is what actually guards it. For use outside the home network, put it
+behind Tailscale or a Cloudflare tunnel rather than opening a port — see
+[remote-android/README.md](remote-android/README.md#beyond-the-home-network).
 
 ## Listen Together
 
