@@ -249,6 +249,21 @@ cargo tauri build
 
 Windows and macOS instructions live in [docs/BUILD-PLATFORMS.md](docs/BUILD-PLATFORMS.md).
 
+### Use `cargo tauri build`, not `cargo build`
+
+`cargo build --release` produces a binary that **looks** fine and then opens a
+`localhost refused to connect` page when run: it never embeds the frontend, so the app falls back to
+the `devUrl` in `tauri.conf.json` and finds nothing listening there.
+
+Only `cargo tauri build` (which runs the frontend build and embeds the result) gives a runnable
+app. Reach for `--no-bundle` to skip the installers and get just the executable.
+
+To tell the two apart after the fact, check for the embedded frontend:
+
+```bash
+grep -c "_app/immutable" target/release/limusic-app.exe   # 0 means it was a plain cargo build
+```
+
 ---
 
 ## Keeping this fork up to date
