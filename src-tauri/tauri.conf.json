@@ -60,6 +60,7 @@
     }
   },
   "plugins": {
+    "_comment_updater": "This fork keeps upstream's endpoint so `cargo tauri build` stays a stock config change, but ships with the update banner OFF (see the `update_banner` setting, which this fork writes on first run). Upstream's endpoint offers a build WITHOUT the Phone remote, and accepting it silently replaces this one with a binary missing the feature - that is exactly what happened once. Do not turn the banner back on unless this fork publishes its own releases and its own signing key.",
     "updater": {
       "endpoints": [
         "https://github.com/SimoHypers/limusic/releases/latest/download/latest.json"

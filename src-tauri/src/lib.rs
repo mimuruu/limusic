@@ -441,6 +441,21 @@ pub fn run() {
                 }
             }
 
+            // Turn the in-app update banner off, once, on a fresh install.
+            //
+            // Why this fork forces it: the updater endpoint in tauri.conf.json is upstream's (see
+            // the `_comment_updater` note there). Accepting that offer installs a build WITHOUT the
+            // Phone remote, silently replacing this one — which is not a hypothetical, it happened.
+            // The banner is the only path that leads there, so a fork that cannot publish its own
+            // releases should not be pointing users at it.
+            //
+            // Written only when the key is absent, so a user who deliberately turned it back on
+            // keeps that choice across launches. Not a replacement for publishing our own releases;
+            // it is the honest default while there are none.
+            if app_state.db.get_setting("update_banner").is_none() {
+                app_state.db.set_setting("update_banner", "false");
+            }
+
             // A custom app icon (#173) has to be pushed at each surface every launch, since only
             // the .exe/.desktop icon is baked in and that one we can't touch. Guarded, rather than
             // unconditional: with no custom icon there is nothing to restore, and on Windows
