@@ -44,7 +44,13 @@ After pairing, the token is saved and the app opens straight to the remote. To u
 | --- | --- |
 | **Playing** | Play/pause, next, previous, seek, volume, shuffle, repeat (off/all/one) |
 | **Queue** | See what's next, tap to jump to a track, swipe to remove |
+| **Lyrics** | Read along: the desktop's lyrics, following the song, word by word where the provider has timings |
 | **Search** | Search YouTube Music, tap a result to play it on the desktop |
+
+Lyrics come from the desktop (`/api/lyrics`), not from this app — it resolves them through the same
+provider chain and cache its own panel uses, so the phone shows the same text, the same source and
+the same word timings. If nobody has lyrics for a track, the tab says so rather than showing an
+error.
 
 ## Security
 
