@@ -144,6 +144,64 @@ void main() {
     });
   });
 
+  group('Lyrics', () {
+    Lyrics synced() => Lyrics.fromJson({
+          'source': 'Boidu',
+          'synced': true,
+          'instrumental': false,
+          'lines': [
+            {'time_ms': 1000, 'text': 'One'},
+            {'time_ms': 5000, 'text': 'Two'},
+            {'time_ms': 9000, 'text': 'Three'},
+          ],
+        });
+
+    test('picks the line whose time has passed', () {
+      final l = synced();
+      expect(l.lineAt(0), -1, reason: 'nothing has started yet');
+      expect(l.lineAt(1.0), 0);
+      expect(l.lineAt(4.999), 0);
+      expect(l.lineAt(5.0), 1);
+      expect(l.lineAt(100), 2, reason: 'past the last line, it stays on it');
+    });
+
+    test('an unsynced set has no line to point at', () {
+      // No time_ms anywhere: the view shows the text without a highlight rather than guessing.
+      final l = Lyrics.fromJson({
+        'source': 'LRCLIB',
+        'synced': false,
+        'lines': [
+          {'text': 'One'},
+          {'text': 'Two'},
+        ],
+      });
+      expect(l.lineAt(30), -1);
+      expect(l.lines.length, 2);
+    });
+
+    test('counts the words already sung, for the per-word highlight', () {
+      final line = LyricLine.fromJson({
+        'time_ms': 1000,
+        'end_time_ms': 3000,
+        'text': 'Sudah',
+        'words': [
+          {'start_ms': 1000, 'end_ms': 1500, 'text': 'Su'},
+          {'start_ms': 1500, 'end_ms': 3000, 'text': 'dah'},
+        ],
+      });
+      expect(line.wordsSung(0.9), 0);
+      expect(line.wordsSung(1.2), 1);
+      expect(line.wordsSung(1.6), 2);
+      expect(line.wordsSung(99), 2, reason: 'never more than the words there are');
+    });
+
+    test('a line with no word timings reports none sung', () {
+      final line = LyricLine.fromJson({'time_ms': 1000, 'text': 'Plain'});
+      expect(line.wordsSung(5), 0);
+      expect(line.words, isNull);
+    });
+  });
+
   group('PairScreen', () {
     testWidgets('asks for an address before showing the code field', (tester) async {
       await tester.pumpWidget(MaterialApp(

@@ -400,6 +400,66 @@ async fn handle(
             Ok((StatusCode::OK, snap))
         }
         (Method::GET, "/api/queue") => Ok((StatusCode::OK, state.queue_snapshot().await)),
+        (Method::GET, "/api/lyrics") => {
+            // Which track? The one playing, or an explicit `?videoId=` for a track the phone is
+            // showing but the desktop has moved past (the queue highlight and the playing track can
+            // disagree for a moment). Everything else `get_lyrics` needs — title, artists, album,
+            // duration — is only known for the *current* track, so an explicit id without a
+            // matching title falls back to asking the desktop's own now-playing.
+            let wanted = query_param(&query, "videoId");
+            let snap = state.playback_snapshot().await;
+            let now = snap.get("now");
+
+            let (video_id, title, artists, album, duration) = match (wanted, now) {
+                (Some(id), Some(n)) if n.get("videoId").and_then(|v| v.as_str()) == Some(id.as_str()) => (
+                    id,
+                    n.get("title").and_then(|v| v.as_str()).unwrap_or_default().to_owned(),
+                    n.get("artists").and_then(|v| v.as_str()).unwrap_or_default().to_owned(),
+                    n.get("album").and_then(|v| v.as_str()).map(str::to_owned),
+                    snap.get("duration").and_then(serde_json::Value::as_f64),
+                ),
+                // No id, or one that is not what is playing: answer for what *is* playing, which is
+                // the only track whose metadata this side actually has.
+                (_, Some(n)) => (
+                    n.get("videoId").and_then(|v| v.as_str()).unwrap_or_default().to_owned(),
+                    n.get("title").and_then(|v| v.as_str()).unwrap_or_default().to_owned(),
+                    n.get("artists").and_then(|v| v.as_str()).unwrap_or_default().to_owned(),
+                    n.get("album").and_then(|v| v.as_str()).map(str::to_owned),
+                    snap.get("duration").and_then(serde_json::Value::as_f64),
+                ),
+                (_, None) => {
+                    return Err((StatusCode::CONFLICT, "nothing is playing yet".to_string()))
+                }
+            };
+
+            if video_id.is_empty() {
+                return Err((StatusCode::CONFLICT, "nothing is playing yet".to_string()));
+            }
+
+            // `get_lyrics` is the same call the desktop's own lyrics panel makes, so the phone sees
+            // exactly what the app does — same providers, same cache, same word timings.
+            let found = crate::lyrics::get_lyrics(
+                &state,
+                crate::lyrics::LyricsRequest {
+                    video_id,
+                    title,
+                    artists,
+                    album,
+                    duration: duration.filter(|d| *d > 0.0),
+                },
+            )
+            .await;
+
+            // `None` is "nobody has lyrics for this", which is an answer, not a failure: the phone
+            // shows that rather than an error banner.
+            Ok((
+                StatusCode::OK,
+                match found {
+                    Some(l) => serde_json::json!({ "lyrics": l }),
+                    None => serde_json::json!({ "lyrics": null }),
+                },
+            ))
+        }
         (Method::GET, "/api/search") => {
             let q = query_param(&query, "q").unwrap_or_default();
             if q.trim().is_empty() {

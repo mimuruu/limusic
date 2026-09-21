@@ -451,6 +451,7 @@ class _RemoteScreenState extends State<RemoteScreen> {
                         onTransport: _do,
                       ),
                       _QueueView(api: widget.api, status: s, doAction: _do, tab: _tab),
+                      _LyricsView(api: widget.api, status: s, tab: _tab),
                       _SearchView(api: widget.api, doAction: _do),
                     ],
                   ),
@@ -463,6 +464,7 @@ class _RemoteScreenState extends State<RemoteScreen> {
         destinations: const [
           NavigationDestination(icon: Icon(Icons.play_circle_outline), label: 'Playing'),
           NavigationDestination(icon: Icon(Icons.queue_music), label: 'Queue'),
+          NavigationDestination(icon: Icon(Icons.lyrics_outlined), label: 'Lyrics'),
           NavigationDestination(icon: Icon(Icons.search), label: 'Search'),
         ],
       ),
@@ -836,6 +838,291 @@ class _QueueViewState extends State<_QueueView> {
               trailing: playing ? const Icon(Icons.equalizer) : Text(song.duration ?? ''),
               onTap: () => widget.doAction(() => widget.api.playIndex(i)),
             ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+/// The "Lyrics" tab: the desktop's lyrics, following the song.
+///
+/// The desktop already resolves lyrics from its provider chain and caches them, so this asks it
+/// (`/api/lyrics`) rather than talking to LRCLIB or Boidu itself. That keeps one source of truth
+/// and means the phone shows exactly what the app's own panel would.
+class _LyricsView extends StatefulWidget {
+  final LimusicApi api;
+  final NowPlaying status;
+  final int tab;
+  const _LyricsView({required this.api, required this.status, required this.tab});
+
+  @override
+  State<_LyricsView> createState() => _LyricsViewState();
+}
+
+class _LyricsViewState extends State<_LyricsView> {
+  final _scroll = ScrollController();
+
+  /// The track these lyrics belong to, so a poll that reports the same song does not refetch.
+  String? _loadedFor;
+  Lyrics? _lyrics;
+  bool _loading = false;
+
+  /// True when the desktop answered "nobody has lyrics for this", which is not the same as "not
+  /// loaded yet" and should say so.
+  bool _none = false;
+
+  String? _error;
+
+  /// A key per lyric line, so the active one can be brought into view with `ensureVisible`.
+  ///
+  /// Offsets were the first attempt and they do not work here: a row can report its global screen
+  /// position, but that is not a scroll offset, and the two diverge as soon as the list is not at
+  /// the top. `ensureVisible` asks the scrollable itself, which is right by construction.
+  final _lineKeys = <int, GlobalKey>{};
+
+  /// The line that was last scrolled to, so the view follows the song once per line instead of
+  /// fighting the user's own scrolling.
+  int _lastScrolled = -1;
+
+  /// True while the user is dragging, so auto-scroll backs off until they let go.
+  bool _userScrolling = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _scroll.addListener(() {
+      // A drag or a fling means the user is reading something else; stop chasing the song until
+      // they settle (the notifier clears once the scroll activity finishes).
+      _userScrolling = _scroll.position.isScrollingNotifier.value;
+    });
+    if (widget.tab == 2) _load();
+  }
+
+  @override
+  void dispose() {
+    _scroll.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didUpdateWidget(covariant _LyricsView old) {
+    super.didUpdateWidget(old);
+    if (widget.tab != 2) return;
+    final id = widget.status.song?.videoId;
+    if (id != null && id != _loadedFor) {
+      // A new track: start over, so the previous song's lyrics never show under the new title.
+      _loadedFor = id;
+      _lyrics = null;
+      _none = false;
+      _lineKeys.clear();
+      _lastScrolled = -1;
+      _load();
+    }
+  }
+
+  Future<void> _load() async {
+    final song = widget.status.song;
+    if (song == null || _loading) return;
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final l = await widget.api.lyrics();
+      if (!mounted) return;
+      setState(() {
+        _lyrics = l;
+        _none = l == null;
+      });
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() => _error = e.message);
+    } catch (_) {
+      if (mounted) setState(() => _error = 'Could not load lyrics.');
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  /// Bring the active line into view, once per line, unless the user is scrolling.
+  void _followActive(int active) {
+    if (_userScrolling || active < 0 || active == _lastScrolled) return;
+    final key = _lineKeys[active];
+    final ctx = key?.currentContext;
+    if (ctx == null) return; // not built yet (off screen); the next tick will catch it
+    _lastScrolled = active;
+    Scrollable.ensureVisible(
+      ctx,
+      duration: const Duration(milliseconds: 350),
+      curve: Curves.easeOut,
+      // Land the line a third of the way down rather than at the very top, which leaves the
+      // upcoming lyrics visible where a reader expects them.
+      alignment: 0.33,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    if (widget.status.song == null) {
+      return const Center(child: Text('Nothing is playing.'));
+    }
+    if (_loading && _lyrics == null) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_error != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(_error!, textAlign: TextAlign.center),
+              const SizedBox(height: 12),
+              OutlinedButton(onPressed: _load, child: const Text('Try again')),
+            ],
+          ),
+        ),
+      );
+    }
+
+    final l = _lyrics;
+    if (l == null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Text(
+            _none ? 'No lyrics found for this track.' : 'No lyrics.',
+            textAlign: TextAlign.center,
+            style: theme.textTheme.bodyMedium
+                ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+          ),
+        ),
+      );
+    }
+
+    if (l.instrumental) {
+      return const Center(child: Text('This track is instrumental.'));
+    }
+
+    // The desktop's position is what the highlight follows. It updates once a second, so the active
+    // line lands within a second of the audio — fine for reading along.
+    final pos = widget.status.position;
+    final active = l.synced ? l.lineAt(pos) : -1;
+    if (l.synced) {
+      // After this frame, the row for `active` will have reported its offset.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _followActive(active);
+      });
+    }
+
+    return Column(
+      children: [
+        Expanded(
+          child: ListView.builder(
+            controller: _scroll,
+            padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+            itemCount: l.lines.length,
+            itemBuilder: (context, i) {
+              final line = l.lines[i];
+              final isActive = i == active;
+              return _LyricRow(
+                key: _lineKeys.putIfAbsent(i, () => GlobalKey()),
+                line: line,
+                active: isActive,
+                position: pos,
+                synced: l.synced,
+              );
+            },
+          ),
+        ),
+        // Attribution, same idea as the desktop's panel footer: these lyrics are not ours.
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+          color: theme.colorScheme.surfaceContainerHighest,
+          child: Text(
+            l.source.isEmpty ? 'Lyrics' : 'Lyrics from ${l.source}',
+            style: theme.textTheme.bodySmall
+                ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// One lyric line. Highlights the words already sung when the line carries per-word timings, and
+/// falls back to styling the whole line when it does not.
+///
+/// Keyed by the parent so the active line can be scrolled into view.
+class _LyricRow extends StatelessWidget {
+  final LyricLine line;
+  final bool active;
+  final double position;
+  final bool synced;
+
+  const _LyricRow({
+    super.key,
+    required this.line,
+    required this.active,
+    required this.position,
+    required this.synced,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final base = theme.textTheme.titleMedium;
+    final activeStyle = base?.copyWith(
+      color: theme.colorScheme.primary,
+      fontWeight: FontWeight.w600,
+    );
+    // Unsynced lyrics have no timeline to follow, so every line reads the same.
+    final idleStyle = base?.copyWith(
+      color: synced ? theme.colorScheme.onSurfaceVariant : theme.colorScheme.onSurface,
+    );
+
+    final sung = active ? line.wordsSung(position) : 0;
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Builder(
+        builder: (context) {
+          final words = line.words;
+          final child = (words == null || words.isEmpty)
+              ? Text(line.text, style: active ? activeStyle : idleStyle)
+              : RichText(
+                  text: TextSpan(
+                    style: active ? activeStyle : idleStyle,
+                    children: [
+                      for (var w = 0; w < words.length; w++)
+                        TextSpan(
+                          text: words[w].text,
+                          style: (w < sung)
+                              ? TextStyle(color: theme.colorScheme.primary)
+                              : null,
+                        ),
+                    ],
+                  ),
+                );
+
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              child,
+              if (line.translation != null && active)
+                Padding(
+                  padding: const EdgeInsets.only(top: 2),
+                  child: Text(
+                    line.translation!,
+                    style: theme.textTheme.bodySmall
+                        ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+                  ),
+                ),
+            ],
           );
         },
       ),

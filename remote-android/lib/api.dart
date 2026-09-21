@@ -191,6 +191,128 @@ class LimusicApi {
   /// Play a track. The whole `SongItem` goes back, so the desktop can seed its queue without a
   /// second round trip.
   Future<void> play(Song song) => _post('/api/play', song.raw);
+
+  /// Lyrics for the track that is playing.
+  ///
+  /// Returns `null` when nobody has lyrics for it, which is a normal answer (the desktop's own
+  /// panel says the same thing) and not an error to surface as a banner.
+  Future<Lyrics?> lyrics({String? videoId}) async {
+    final path = videoId == null ? '/api/lyrics' : '/api/lyrics?videoId=$videoId';
+    final body = await _decode(
+        await http.get(_uri(path), headers: _headers).timeout(_timeout));
+    final l = body['lyrics'];
+    return l is Map<String, dynamic> ? Lyrics.fromJson(l) : null;
+  }
+}
+
+/// Lyrics for one track, as the desktop's provider chain produced them.
+///
+/// `synced` is the difference between a wall of text and something worth showing while the song
+/// plays: when it is true every line carries a `timeMs` and the UI can follow along. `words` goes
+/// one better and carries per-word timings (the desktop's "word by word" mode), which is what the
+/// highlight rides on when present.
+class Lyrics {
+  final String source;
+  final bool synced;
+  final bool instrumental;
+  final List<LyricLine> lines;
+
+  Lyrics({
+    required this.source,
+    required this.synced,
+    required this.instrumental,
+    required this.lines,
+  });
+
+  factory Lyrics.fromJson(Map<String, dynamic> j) => Lyrics(
+        source: j['source'] as String? ?? '',
+        synced: j['synced'] as bool? ?? false,
+        instrumental: j['instrumental'] as bool? ?? false,
+        lines: (j['lines'] as List<dynamic>? ?? const [])
+            .map((e) => LyricLine.fromJson(e as Map<String, dynamic>))
+            .toList(),
+      );
+
+  /// Index of the line that should be highlighted at [positionSeconds], or -1 when nothing has
+  /// started yet.
+  ///
+  /// The desktop reports a position that can sit slightly behind or ahead of the phone's own read
+  /// of it, so this is a plain "last line whose time has passed" scan rather than anything clever.
+  /// Doing it here (instead of asking the desktop for the current line) keeps the highlight moving
+  /// between polls, which is what makes it feel like it is following the song.
+  int lineAt(double positionSeconds) {
+    if (lines.isEmpty) return -1;
+    final ms = (positionSeconds * 1000).round();
+    var found = -1;
+    for (var i = 0; i < lines.length; i++) {
+      final t = lines[i].timeMs;
+      if (t == null) continue;
+      if (t > ms) break;
+      found = i;
+    }
+    return found;
+  }
+}
+
+class LyricLine {
+  final int? timeMs;
+  final int? endTimeMs;
+  final String text;
+  final List<LyricWord>? words;
+  final String? translation;
+
+  LyricLine({
+    required this.timeMs,
+    required this.endTimeMs,
+    required this.text,
+    required this.words,
+    required this.translation,
+  });
+
+  factory LyricLine.fromJson(Map<String, dynamic> j) => LyricLine(
+        timeMs: (j['time_ms'] as num?)?.toInt(),
+        endTimeMs: (j['end_time_ms'] as num?)?.toInt(),
+        text: j['text'] as String? ?? '',
+        words: (j['words'] as List<dynamic>?)
+            ?.map((e) => LyricWord.fromJson(e as Map<String, dynamic>))
+            .toList(),
+        translation: j['translation'] as String?,
+      );
+
+  /// How many words of this line have been reached at [positionSeconds].
+  ///
+  /// Per-word timings are what make the highlight move *within* a line rather than jumping line by
+  /// line. Returns 0 when the line has no word data, which falls back to highlighting the whole
+  /// line — still correct, just coarser.
+  int wordsSung(double positionSeconds) {
+    final ws = words;
+    if (ws == null || ws.isEmpty) return 0;
+    final ms = (positionSeconds * 1000).round();
+    var sung = 0;
+    for (final w in ws) {
+      final s = w.startMs;
+      if (s == null || s > ms) break;
+      sung++;
+    }
+    return sung;
+  }
+}
+
+class LyricWord {
+  /// Milliseconds the word starts, and ends. Both present whenever the provider gave per-word
+  /// timings (the desktop fields them `start_ms`/`end_ms` — note `LyricLine` above uses
+  /// `time_ms` instead, which is why the two are read differently).
+  final int? startMs;
+  final int? endMs;
+  final String text;
+
+  LyricWord({required this.startMs, required this.endMs, required this.text});
+
+  factory LyricWord.fromJson(Map<String, dynamic> j) => LyricWord(
+        startMs: (j['start_ms'] as num?)?.toInt(),
+        endMs: (j['end_ms'] as num?)?.toInt(),
+        text: j['text'] as String? ?? '',
+      );
 }
 
 /// Human-readable clock for a duration in seconds.
