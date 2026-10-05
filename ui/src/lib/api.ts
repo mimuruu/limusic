@@ -71,6 +71,7 @@ export interface NowPlaying {
 	artistRuns?: ArtistRun[];
 	thumbnail?: string;
 	duration?: string;
+	album?: string | null;
 	streamClient: string;
 	/** The user's rating of the track (null if unknown). */
 	rating?: Rating | null;
@@ -84,13 +85,17 @@ export type RepeatMode = 'off' | 'all' | 'one';
 export interface QueueState {
 	items: SongItem[];
 	currentIndex: number;
-	/** Start of the previously-played run: `items[playedFrom..currentIndex]` has actually been
-	 *  heard. Not `0..currentIndex`: a playlist opened at track 7 has six untouched tracks first. */
-	playedFrom?: number;
 	shuffle?: boolean;
 	repeat?: RepeatMode;
 	/** What seeded the queue (playlist/album title, "<song> Radio") — the "Next from" header. */
 	sourceName?: string | null;
+	/** The playlist the queue was started from, when it was one. What "Remove from this playlist"
+	 *  in the player's track menu writes to; absent for radios, single songs and guest queues. */
+	sourceId?: string | null;
+	/** Title of the track a click replaced this queue mid-play, for the panel's "Back to …" line.
+	 *  Set only while `backToPrevious` would actually do something: at the head of the queue, with
+	 *  a kept one behind it. */
+	prevTrack?: string | null;
 }
 
 export interface Account {
@@ -137,6 +142,8 @@ export interface BrowseItem {
 	thumbnail?: string;
 	/** "3:47" — song items from a list-style shelf only (card shelves don't carry one). */
 	duration?: string;
+	/** Song cards only: the track's album (`MPRE…`), what puts "Go to album" in its menus. */
+	albumId?: string;
 	/** Song cards only: the artist line run by run, so a card that gets played keeps its links. */
 	artistRuns?: ArtistRun[];
 	/** Play count as YouTube abbreviates it ("2.5B") — search song rows only. */
@@ -201,11 +208,21 @@ export const LOCAL_SONG_PREFIX = 'LOCAL:';
 export const LOCAL_ALBUM_PREFIX = 'LOCALALBUM:';
 /** An artist on this disk. Renders through the album route: same page, no YouTube channel. */
 export const LOCAL_ARTIST_PREFIX = 'LOCALARTIST:';
+/**
+ * A playlist kept on this machine, no account needed (#251; mirrors `LOCAL_PLAYLIST_PREFIX` in
+ * state.rs). The playlist commands answer it from SQLite, so it rides the same route and the same
+ * calls as a YouTube playlist, and can hold local files as well as YouTube tracks.
+ */
+export const LOCAL_PLAYLIST_PREFIX = 'LOCALPLAYLIST:';
+export const isLocalPlaylist = (id: string | undefined | null): boolean =>
+	!!id && id.startsWith(LOCAL_PLAYLIST_PREFIX);
+/** Anything with no YouTube item behind it: nothing to share, no radio, no account to save it to. */
 export const isLocalId = (id: string | undefined | null): boolean =>
 	!!id &&
 	(id.startsWith(LOCAL_SONG_PREFIX) ||
 		id.startsWith(LOCAL_ALBUM_PREFIX) ||
-		id.startsWith(LOCAL_ARTIST_PREFIX));
+		id.startsWith(LOCAL_ARTIST_PREFIX) ||
+		id.startsWith(LOCAL_PLAYLIST_PREFIX));
 
 export interface LocalLibrary {
 	/** Watched folders, as absolute paths. */
@@ -275,6 +292,12 @@ export interface SearchResults {
 	playlists: BrowseItem[];
 }
 
+/** Typeahead under a search field: query completions, then a few matching rows. */
+export interface SearchSuggestions {
+	queries: { text: string; /** One of the account's own past searches. */ history: boolean }[];
+	items: BrowseItem[];
+}
+
 export interface AlbumPage {
 	title?: string;
 	artist?: string;
@@ -317,9 +340,16 @@ export interface ArtistPage {
 // account's YouTube search history, so a typeahead preview must stay anonymous (#203).
 export const search = (query: string, recordHistory = false) =>
 	invoke<SongItem[]>('search', { query, recordHistory });
+/** Video uploads only: covers, live sets and remixes with no official release. Empty when the
+ *  "hide music videos" setting is on. */
+export const searchVideos = (query: string) => invoke<SongItem[]>('search_videos', { query });
 /** Unfiltered search → categorized sections. */
 export const searchAll = (query: string, recordHistory = false) =>
 	invoke<SearchResults>('search_all', { query, recordHistory });
+/** The typeahead. Signed in, yet never written to search history: it's the request YTM's own
+ *  search box sends on every keystroke. */
+export const searchSuggestions = (query: string) =>
+	invoke<SearchSuggestions>('search_suggestions', { query });
 /** Filtered "Show more" card search for one category (albums / artists / playlists). */
 export const searchCards = (query: string, category: 'albums' | 'artists' | 'playlists') =>
 	invoke<BrowseItem[]>('search_cards', { query, category });
@@ -332,23 +362,26 @@ export const removeFromQueue = (index: number) => invoke<void>('remove_from_queu
 export const moveInQueue = (from: number, to: number) =>
 	invoke<void>('move_in_queue', { from, to });
 /**
- * "Play next": insert tracks at the front of the "Next in queue" block, behind any earlier
- * "Play next" adds. `from` is the album/playlist they came from — it heads the block in the panel.
+ * "Play next": insert tracks right behind the playing one, behind any earlier "Play next" adds.
+ * `from` is the album/playlist they came from.
  */
 export const playNext = (items: SongItem[], from?: string) =>
 	invoke<void>('play_next', { items, from });
 /**
- * "Add to queue": the tracks go at the *back* of the same block — after everything already queued
- * by hand, ahead of the playing context and anything the app generated behind it.
- * `continuation` is the source page's next-page token — the backend walks the rest of a long
- * playlist into the queue in the background.
+ * "Add to queue": the tracks go at the tail of the queue, behind the rest of the playing album or
+ * playlist and anything added before, ahead of autoplay (#369). On a radio they go ahead of the
+ * generated tracks instead. `continuation` is the source page's next-page token: the backend walks
+ * the rest of a long playlist into the queue in the background.
  */
 export const addToQueue = (items: SongItem[], from?: string, continuation?: string) =>
 	invoke<void>('add_to_queue', { items, from, continuation });
-/** Clear every upcoming manually-queued track (the "Next in queue" section). */
+/** Clear every upcoming track added by hand, with Play next or Add to queue. */
 export const clearQueued = () => invoke<void>('clear_queued');
 export const nextTrack = () => invoke<void>('next_track');
 export const prevTrack = () => invoke<void>('prev_track');
+/** Put back the queue a click replaced, at the track and position it was left at. Previous does
+ *  this too, but only from the top of a track. */
+export const backToPrevious = () => invoke<void>('back_to_previous');
 export const toggleShuffle = () => invoke<void>('toggle_shuffle');
 export const setRepeat = (mode: RepeatMode) => invoke<void>('set_repeat', { mode });
 export const togglePause = () => invoke<void>('toggle_pause');
@@ -367,6 +400,23 @@ export const videoStream = (videoId: string, maxHeight: number) =>
 /** Drop the backend's memory of this track's video URL, after the element failed to load it. */
 export const forgetVideoStream = (videoId: string) =>
 	invoke<void>('forget_video_stream', { videoId });
+
+/** Linux and Windows: where the page's hole for the music video is (`[x, y, w, h]`, CSS pixels,
+ *  relative to the viewport), or null when there is none. mpv draws the picture there, under the
+ *  webview. Resolves whether the picture is up; `false` for a rect means it never will be (no
+ *  surface), so fall back to the `<video>` element. `dpr` carries the page zoom to Windows. */
+export const nativeVideoRect = (rect: [number, number, number, number] | null) =>
+	invoke<boolean>('native_video_rect', { rect, dpr: devicePixelRatio });
+
+/** Linux and Windows: the newest small frame of mpv's picture other than `after`, for the ambient
+ *  light, as `[seq, w, h]` little-endian u32s and then RGBA rows bottom-up. Empty when there is no
+ *  new one (Linux waits a quarter second for it). Asking is also what keeps Rust grabbing them
+ *  (nativevideo.rs; on Windows each ask is one grab, nativevideo_windows.rs).
+ *  An ArrayBuffer, except once Tauri has fallen back from its custom protocol to postMessage (it
+ *  does for the rest of the page's life after any IPC fetch fails): raw bytes then arrive as a
+ *  plain array of numbers. */
+export const ambientFrame = (after: number) =>
+	invoke<ArrayBuffer | number[]>('ambient_frame', { after });
 
 /** What the event stream already reported, for a webview that started after it did. */
 export interface PlaybackSnapshot {
@@ -418,6 +468,24 @@ export const appIconPath = () => invoke<string | null>('app_icon_path');
 /** Grant the webview a URL for one font file the user picked, so `@font-face` can load it. */
 export const allowFontFile = (path: string) => invoke<void>('allow_font_file', { path });
 
+// --- global hotkeys -------------------------------------------------------------------------
+export interface HotkeysConfig {
+	enabled: boolean;
+	bindings: Record<string, string>;
+}
+
+export interface HotkeyRegisterResult {
+	success: boolean;
+	config: HotkeysConfig;
+	errors: Record<string, string>;
+}
+
+export const getGlobalHotkeys = () => invoke<HotkeysConfig>('get_global_hotkeys');
+export const globalHotkeysOnWayland = () => invoke<boolean>('global_hotkeys_on_wayland');
+export const setGlobalHotkeys = (config: HotkeysConfig) =>
+	invoke<HotkeyRegisterResult>('set_global_hotkeys', { config });
+export const resetGlobalHotkeys = () => invoke<HotkeyRegisterResult>('reset_global_hotkeys');
+
 /** One published release: the GitHub release description, verbatim markdown. */
 export interface ReleaseNote {
 	version: string;
@@ -430,6 +498,12 @@ export const releaseNotes = () => invoke<ReleaseNote[]>('release_notes');
 /** False on Linux builds that aren't the AppImage (.rpm, the AUR package): they update through the
  *  package manager, so the UI offers a download link instead of an install button. */
 export const canSelfUpdate = () => invoke<boolean>('can_self_update');
+/** The updater plugin's `check()` against the beta channel's manifest, as the metadata the
+ *  plugin's `Update` class is built from. `null` when this build is what the channel offers. */
+export const checkBetaUpdate = () =>
+	invoke<ConstructorParameters<typeof import('@tauri-apps/plugin-updater').Update>[0] | null>(
+		'check_beta_update'
+	);
 /** Open an http(s) link in the real browser, never in the webview itself. */
 export const openExternal = (url: string) => invoke<void>('open_external', { url });
 
@@ -466,6 +540,8 @@ export const removeGoogleAccount = (id: string) => invoke<void>('remove_google_a
 export const openMini = () => invoke<void>('open_mini');
 /** Close the widget and bring the app back. */
 export const closeMini = () => invoke<void>('close_mini');
+/** Shrink the widget to its compact size, or back (#301). Remembered for the next open. */
+export const setMiniCompact = (compact: boolean) => invoke<void>('set_mini_compact', { compact });
 
 // --- browse / library (context/08) ---------------------------------------------------------
 /** `params` is a `HomeChip.params` token — omit for the unfiltered feed. */
@@ -489,8 +565,26 @@ const relabelOnRepeat = (item: BrowseItem): BrowseItem =>
 					: t('library.songs_count', { count: parseInt(item.subtitle!, 10) })
 			};
 
+/** Same reason as On Repeat: Rust's "12 songs" on a playlist kept on this machine. */
+const relabelLocal = (item: BrowseItem): BrowseItem => {
+	if (!isLocalPlaylist(item.id)) return relabelOnRepeat(item);
+	const count = parseInt(item.subtitle ?? '', 10);
+	if (Number.isNaN(count)) return item;
+	return {
+		...item,
+		subtitle:
+			count === 1
+				? t('library.local_playlist_subtitle_one')
+				: t('library.local_playlist_subtitle', { count })
+	};
+};
+
+/** Every playlist in the library: On Repeat, the ones on this machine, then the account's. */
 export const getLibrary = () =>
-	invoke<BrowseItem[]>('get_library').then((items) => items.map(relabelOnRepeat));
+	invoke<BrowseItem[]>('get_library').then((items) => items.map(relabelLocal));
+/** Just the playlists on this machine. SQLite only, so it answers offline and signed out. */
+export const getLocalPlaylists = () =>
+	invoke<BrowseItem[]>('local_playlists').then((items) => items.map(relabelLocal));
 export const getLibraryAlbums = () => invoke<BrowseItem[]>('get_library_albums');
 export const getLibraryArtists = () => invoke<BrowseItem[]>('get_library_artists');
 export const getUploadAlbums = () => invoke<BrowseItem[]>('get_upload_albums');
@@ -564,6 +658,22 @@ export const startRadio = (kind: 'song' | 'artist' | 'album' | 'playlist', id: s
 	invoke<void>('start_radio', { kind, id, name });
 export const getAlbum = (id: string) => invoke<AlbumPage>('get_album', { id });
 export const getArtist = (id: string) => invoke<ArtistPage>('get_artist', { id });
+/** A Moods & Genres tile. `params` browses `MOODS_CATEGORY_ID` into that mood's playlists. */
+export interface Mood {
+	title: string;
+	params: string;
+	/** YouTube's own colour for the tile, `#rrggbb`. */
+	color: string;
+}
+export interface MoodSection {
+	title: string;
+	items: Mood[];
+}
+export const MOODS_CATEGORY_ID = 'FEmusic_moods_and_genres_category';
+export const getMoods = () => invoke<MoodSection[]>('get_moods');
+/** A cover per tile (the first playlist in its category), keyed by the tile's `params`. */
+export const getMoodArt = (params: string[]) =>
+	invoke<Record<string, string>>('get_mood_art', { params });
 export const getBrowseGrid = (id: string, params?: string) =>
 	invoke<BrowseItem[]>('get_browse_grid', { id, params });
 
@@ -592,11 +702,22 @@ export const unblockArtist = (key: string) => invoke<BlockedArtist[]>('unblock_a
  *  un-likes in the same call. */
 export const rate = (videoId: string, rating: Rating) => invoke<void>('rate', { videoId, rating });
 /** `false` = the playlist already had this track, so YouTube added nothing. */
-export const addToPlaylist = (playlistId: string, videoId: string) =>
-	invoke<boolean>('add_to_playlist', { playlistId, videoId });
+export const addToPlaylist = (playlistId: string, videoId: string, allowDuplicates = false) =>
+	invoke<boolean>('add_to_playlist', { playlistId, videoId, allowDuplicates });
 export const removeFromPlaylist = (playlistId: string, videoId: string, setVideoId: string) =>
 	invoke<void>('remove_from_playlist', { playlistId, videoId, setVideoId });
-export const createPlaylist = (title: string) => invoke<string>('create_playlist', { title });
+
+/** Bulk removal: one request, all or nothing. `tracks` is [videoId, setVideoId] per row. */
+export const removeManyFromPlaylist = (playlistId: string, tracks: [string, string][]) =>
+	invoke<void>('remove_many_from_playlist', { playlistId, tracks });
+/** `local` keeps it on this machine instead of the account, the only kind there is signed out.
+ *  Answers the new id: a `LOCALPLAYLIST:` browseId for a local one, YouTube's playlist id else. */
+export const createPlaylist = (title: string, local = false) =>
+	invoke<string>('create_playlist', { title, local });
+/** Add whole songs to a playlist on this machine, in one write. Answers per song whether it went
+ *  in: `false` means the playlist already had it. Local files are fine here. */
+export const addToLocalPlaylist = (playlistId: string, items: SongItem[]) =>
+	invoke<boolean[]>('add_to_local_playlist', { playlistId, items });
 /** Name / description / visibility, from the "Edit playlist" dialog. Leave a field out and
  *  YouTube is never told about it, so an untouched one can't be overwritten. */
 export const editPlaylistDetails = (
@@ -619,6 +740,99 @@ export const setSongSaved = (token: string) => invoke<void>('set_song_saved', { 
 export const setAlbumSaved = (playlistId: string, saved: boolean) =>
 	invoke<void>('set_album_saved', { playlistId, saved });
 
+// --- Spotify import (spotify.rs, import.rs, #375) ----------------------------------------------
+// Rejections are short codes (`private`, `busy`, ...) worded by `importError` in import.svelte.ts.
+
+export type ImportTier = 'pending' | 'matched' | 'check' | 'missing';
+export type ImportPhase = 'matching' | 'review' | 'creating' | 'done' | 'failed' | 'cancelled';
+/** `liked` is Liked Songs, named in the user's language on this side. */
+export type ImportListKind = 'playlist' | 'album' | 'liked';
+
+export interface ImportListPreview {
+	kind: ImportListKind;
+	name: string;
+	owner?: string | null;
+	cover?: string | null;
+	count: number;
+	/** Rows that aren't songs (podcast episodes), left out. */
+	skipped: number;
+	/** Spotify only let the first 100 tracks be read. */
+	truncated: boolean;
+}
+export interface ImportPreview {
+	lists: ImportListPreview[];
+}
+export interface ImportResult {
+	kind: ImportListKind;
+	name: string;
+	/** The browse id to open: `VL…`, or `LOCALPLAYLIST:<n>` on this device. */
+	id: string;
+	local: boolean;
+	added: number;
+	missing: number;
+	removed: number;
+}
+export interface ImportSnapshot {
+	phase: ImportPhase;
+	/** Distinct tracks across every list being imported. */
+	total: number;
+	done: number;
+	matched: number;
+	check: number;
+	missing: number;
+	lists: { kind: ImportListKind; name: string; count: number; cover?: string | null }[];
+	/** The last few tracks matched, newest first. */
+	recent: { title: string; artists: string; tier: ImportTier; thumbnail?: string | null }[];
+	/** While creating: steps done, steps in all. */
+	step: [number, number];
+	/** Pausing to stay within the hourly search budget: the unix second it goes on. */
+	waitingUntil?: number | null;
+	message?: string | null;
+	results: ImportResult[];
+	/** Set when this is an "Update from Spotify" of that playlist rather than an import. */
+	update?: string | null;
+}
+export interface ImportRow {
+	key: string;
+	title: string;
+	artists: string;
+	album?: string | null;
+	durationMs?: number | null;
+	tier: ImportTier;
+	pick?: SongItem | null;
+	/** Empty for matched rows. */
+	candidates: SongItem[];
+}
+export type ImportResolved =
+	| { kind: 'song'; song: SongItem }
+	| { kind: 'album'; id: string }
+	| { kind: 'artist'; id: string }
+	| { kind: 'playlist' };
+
+export const importReadLink = (link: string) => invoke<ImportPreview>('import_read', { link });
+export const importReadPath = (path: string) => invoke<ImportPreview>('import_read', { path });
+/** A dropped file: the bytes go over as the raw request body (a webview drop has no path). */
+export const importReadFile = async (file: File) =>
+	invoke<ImportPreview>('import_read_file', new Uint8Array(await file.arrayBuffer()), {
+		headers: { 'x-file-name': encodeURIComponent(file.name) }
+	});
+/** `lists` are indices into the last preview. */
+export const importStart = (lists: number[]) => invoke<ImportSnapshot>('import_start', { lists });
+export const importStatus = () => invoke<ImportSnapshot | null>('import_status');
+export const importRows = (tier: ImportTier) => invoke<ImportRow[]>('import_rows', { tier });
+/** `null` leaves the track out. A song picked here is remembered for every later import. */
+export const importPick = (key: string, song: SongItem | null) =>
+	invoke<ImportSnapshot>('import_pick', { key, song });
+export const importCreate = (options: { names?: Record<number, string>; local?: boolean }) =>
+	invoke<void>('import_create', { options });
+/** Stops a running import, or puts away a finished one. */
+export const importCancel = () => invoke<void>('import_cancel');
+export const importSource = (playlistId: string) =>
+	invoke<string | null>('import_source', { playlistId });
+export const importUpdate = (playlistId: string) =>
+	invoke<ImportSnapshot>('import_update', { playlistId });
+export const importResolve = (link: string) => invoke<ImportResolved>('import_resolve', { link });
+
 // --- events (context/11). Each returns an unlisten fn; call it on component teardown. --------
 export const onNowPlaying = (cb: (n: NowPlaying) => void): Promise<UnlistenFn> =>
 	listen<NowPlaying>('now-playing', (e) => cb(e.payload));
@@ -630,6 +844,9 @@ export const onRating = (cb: (videoId: string, rating: Rating) => void): Promise
 	listen<{ videoId: string; rating: Rating }>('rating', (e) =>
 		cb(e.payload.videoId, e.payload.rating)
 	);
+/** Linux and Windows: mpv has this track's music video (or will as soon as the track starts). */
+export const onVideoReady = (cb: (videoId: string) => void): Promise<UnlistenFn> =>
+	listen<string>('video-ready', (e) => cb(e.payload));
 export const onQueueChanged = (cb: (q: QueueState) => void): Promise<UnlistenFn> =>
 	listen<QueueState>('queue-changed', (e) => cb(e.payload));
 /**
@@ -640,10 +857,11 @@ export const onQueueChanged = (cb: (q: QueueState) => void): Promise<UnlistenFn>
  */
 export interface QueueIndex {
 	currentIndex: number;
-	playedFrom?: number;
 	shuffle?: boolean;
 	repeat?: RepeatMode;
 	sourceName?: string | null;
+	sourceId?: string | null;
+	prevTrack?: string | null;
 	current: SongItem | null;
 }
 
@@ -659,7 +877,6 @@ export interface QueueAppended {
 	items: SongItem[];
 	len: number;
 	currentIndex: number;
-	playedFrom?: number;
 }
 
 export const onQueueAppended = (cb: (q: QueueAppended) => void): Promise<UnlistenFn> =>
@@ -667,6 +884,11 @@ export const onQueueAppended = (cb: (q: QueueAppended) => void): Promise<Unliste
 /** Main window shown/hidden (close-to-tray, the mini player). WebKitGTK never tells the page. */
 export const onUiVisible = (cb: (v: boolean) => void): Promise<UnlistenFn> =>
 	listen<boolean>('ui-visible', (e) => cb(e.payload));
+/** `limusic-app <link>` (#348): the arguments a cold launch was given, handed over once... */
+export const takeLaunchArgs = () => invoke<string[]>('take_launch_args');
+/** ...and those of a second launch while this one runs. */
+export const onOpenLink = (cb: (args: string[]) => void): Promise<UnlistenFn> =>
+	listen<string[]>('open-link', (e) => cb(e.payload));
 export const onPosition = (cb: (p: number) => void): Promise<UnlistenFn> =>
 	listen<{ position: number }>('position', (e) => cb(e.payload.position));
 export const onDuration = (cb: (d: number) => void): Promise<UnlistenFn> =>
@@ -684,6 +906,8 @@ export const onPlaybackNotice = (cb: (msg: string) => void): Promise<UnlistenFn>
  *  so the failure lands long after the picker closed). */
 export const onCoverError = (cb: (msg: string) => void): Promise<UnlistenFn> =>
 	listen<{ message: string }>('cover-error', (e) => cb(e.payload.message));
+export const onImportProgress = (cb: (s: ImportSnapshot) => void): Promise<UnlistenFn> =>
+	listen<ImportSnapshot>('import-progress', (e) => cb(e.payload));
 export const onAuthChanged = (cb: (a: Account) => void): Promise<UnlistenFn> =>
 	listen<Account>('auth-changed', (e) => cb(e.payload));
 export const onAccountSelectionRequired = (cb: () => void): Promise<UnlistenFn> =>
@@ -712,22 +936,48 @@ export interface LyricLine {
 	text: string;
 	words?: LyricWord[];
 	translation?: string;
+	/** Latin-script reading of `text` (#202). Word-timed only when Apple Music wrote it. */
+	romanized?: string;
+	romanized_words?: LyricWord[];
 }
 export interface Lyrics {
 	/** Attribution for the panel footer ("LRCLIB", "Source: Musixmatch", …). */
 	source: string;
+	/** Id of the provider that answered (`LyricsProvider.id`). */
+	provider: string;
 	synced: boolean;
 	instrumental: boolean;
 	lines: LyricLine[];
+	/** The source was picked by hand for this song (or its timing nudged). */
+	pinned: boolean;
+	/** Timing nudge in ms, positive = lyrics later. */
+	offset_ms: number;
 }
-/** Cached on the Rust side (provider chain: LRCLIB → YT Music). `null` = none found. */
-export const getLyrics = (args: {
+// A type, not an interface: `invoke` takes a record, and only a type alias is assignable to one.
+export type LyricsTrack = {
 	videoId: string;
 	title: string;
 	artists: string;
 	album?: string;
 	duration?: number;
-}) => invoke<Lyrics | null>('get_lyrics', args);
+};
+/** Cached on the Rust side, down the user's provider order. `null` = none found. `source` asks that
+ *  one provider alone and caches nothing (the source picker's preview); it rejects when the
+ *  provider couldn't be reached, which is not the same as it having no lyrics. */
+export const getLyrics = (args: LyricsTrack & { source?: string }) =>
+	invoke<Lyrics | null>('get_lyrics', args);
+/** Keep `source`'s lyrics for this song, or (`null`) hand it back to the provider order. */
+export const chooseLyricsSource = (args: LyricsTrack & { source: string | null }) =>
+	invoke<Lyrics | null>('choose_lyrics_source', args);
+export const setLyricsOffset = (videoId: string, offsetMs: number) =>
+	invoke<void>('set_lyrics_offset', { videoId, offsetMs });
+export interface LyricsProvider {
+	id: string;
+	name: string;
+	on: boolean;
+}
+/** Every provider in the user's order (setting `lyrics_providers`: ids, `-id` switched off). */
+export const lyricsProviders = () => invoke<LyricsProvider[]>('lyrics_providers');
 
 // --- Window ------------------------------------------------------------------------------------
 /** Theater mode's fullscreen. Not `getCurrentWindow().setFullscreen` (#139): Windows needs the
@@ -783,7 +1033,10 @@ export interface LtState {
 	requesting: boolean;
 	roomCode: string | null;
 	myId: string | null;
+	/** Empty means the built-in default; the backend resolves it when it connects. */
 	serverUrl: string;
+	/** What that default is. Only ever rendered inside the "change server" panel. */
+	defaultServerUrl: string;
 	users: LtUser[];
 	currentTrack: LtTrack | null;
 	queue: LtTrack[];

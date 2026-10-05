@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { untrack, type Snippet } from 'svelte';
+	import { tick, untrack, type Snippet } from 'svelte';
 	import { open, save } from '@tauri-apps/plugin-dialog';
 	import { HugeiconsIcon } from '@hugeicons/svelte';
 	import {
@@ -14,6 +14,10 @@
 		Copy01Icon,
 		Coffee02Icon,
 		DiscordIcon,
+		Globe02Icon,
+		ArrowDown01Icon,
+		Alert02Icon,
+		LinkSquare02Icon,
 		SmartPhone01Icon
 	} from '@hugeicons/core-free-icons';
 	import { Button } from '$lib/components/ui/button';
@@ -24,11 +28,13 @@
 	import { Alert, AlertDescription } from '$lib/components/ui/alert';
 	import * as Dialog from '$lib/components/ui/dialog';
 	import * as Select from '$lib/components/ui/select';
+	import * as Popover from '$lib/components/ui/popover';
 	import { HELP_COMBO } from '$lib/shortcuts';
 	import { copyText } from '$lib/clipboard';
 	import * as api from '$lib/api';
-	import { blocked, prefs, ui, toast, unblockArtist } from '$lib/player.svelte';
+	import { blocked, prefs, refreshView, setAutoplay, ui, toast, unblockArtist } from '$lib/player.svelte';
 	import { win } from '$lib/win.svelte';
+	import { lt } from '$lib/lt.svelte';
 	import ColorPicker from '$lib/components/ColorPicker.svelte';
 	import Changelog from '$lib/components/Changelog.svelte';
 	import DiscordSettings from '$lib/components/DiscordSettings.svelte';
@@ -58,19 +64,33 @@
 	} from '$lib/theme.svelte';
 	import {
 		updateState,
+		availableMessage,
 		checkForUpdatesInteractive,
 		installUpdate,
-		openDownloadPage
+		openDownloadPage,
+		recheckForUpdates
 	} from '$lib/updater.svelte';
 	import { getVersion } from '@tauri-apps/api/app';
-	import { t, setLocale, currentLocale, LOCALES, type LocaleId } from '$lib/i18n.svelte';
+	import { t, setLocale, currentLocale, LOCALES } from '$lib/i18n.svelte';
 	import { appIcon, chooseAppIcon } from '$lib/appicon.svelte';
+	import GlobalHotkeysSettings from '$lib/components/GlobalHotkeysSettings.svelte';
+	import LyricsSourcesSettings from '$lib/components/LyricsSourcesSettings.svelte';
+	import LanguagePicker from '$lib/components/LanguagePicker.svelte';
 
-	type TabId = 'general' | 'themes' | 'playback' | 'discord' | 'remote' | 'data' | 'about';
+	type TabId =
+		| 'general'
+		| 'themes'
+		| 'playback'
+		| 'hotkeys'
+		| 'discord'
+		| 'remote'
+		| 'data'
+		| 'about';
 	const TABS = $derived<{ id: TabId; label: string; hint: string; icon: typeof Settings02Icon }[]>([
 		{ id: 'general', label: t('settings.tabs.general'), hint: t('settings.tabs.general_hint'), icon: Settings02Icon },
 		{ id: 'themes', label: t('settings.tabs.themes'), hint: t('settings.tabs.themes_hint'), icon: PaintBoardIcon },
 		{ id: 'playback', label: t('settings.tabs.playback'), hint: t('settings.tabs.playback_hint'), icon: PlayCircleIcon },
+		{ id: 'hotkeys', label: t('settings.tabs.hotkeys'), hint: t('settings.tabs.hotkeys_hint'), icon: KeyboardIcon },
 		{ id: 'discord', label: t('settings.tabs.discord'), hint: t('settings.tabs.discord_hint'), icon: DiscordIcon },
 		{ id: 'remote', label: t('settings.tabs.remote'), hint: t('settings.tabs.remote_hint'), icon: SmartPhone01Icon },
 		{ id: 'data', label: t('settings.tabs.data'), hint: t('settings.tabs.data_hint'), icon: Database02Icon },
@@ -180,6 +200,7 @@
 	const currentLocaleLabel = $derived(
 		LOCALES.find((l) => l.id === currentLocale.id)?.nativeLabel ?? currentLocale.id
 	);
+	let langOpen = $state(false);
 	let settings = $state<Record<string, string>>({});
 	let clients = $state<string[]>([]);
 	let proxyInput = $state('');
@@ -201,6 +222,10 @@
 	let clearing = $state(false);
 	let version = $state('');
 	getVersion().then((v) => (version = v));
+	// Release candidates ship only what the updater installs, so an .rpm, .deb or AUR install has
+	// nothing to take from the beta channel. Shown in dev, which is never the AppImage either.
+	let betaAvailable = $state(import.meta.env.DEV);
+	api.canSelfUpdate().then((v) => (betaAvailable ||= v)).catch(() => {});
 	// Result of the last "Check for updates" click — shown inline (a toast renders behind the modal).
 	let updateResult = $state<{ message: string; error: boolean } | null>(null);
 
@@ -211,7 +236,18 @@
 	$effect(() => {
 		if (!ui.settingsOpen) return;
 		untrack(() => {
-			load();
+			// Opened on a section from elsewhere (the lyrics source picker): its tab, scrolled to it
+			// once the tab has rendered.
+			if (ui.settingsFocus) {
+				tab = 'playback';
+				const id = `settings-${ui.settingsFocus}`;
+				ui.settingsFocus = null;
+				load().then(tick).then(() => {
+					document.getElementById(id)?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+				});
+			} else {
+				load();
+			}
 			updateResult = null;
 			pickerOpen = false;
 			readBack();
@@ -297,12 +333,27 @@
 
 	const quality = $derived(settings.quality ?? 'HIGH');
 	const historyOn = $derived(settings.enable_history !== 'false');
-	const autoplayOn = $derived(settings.autoplay !== 'false');
+	// On unless turned off: loudness matching is what YTM does, and it's what most people want.
+	// Off gives the untouched master, limiter included (#298, #300).
+	const normalizeOn = $derived(settings.normalize_volume !== 'false');
+	// Off by default: experimental, and it runs a second decoder while tracks overlap.
+	const crossfadeOn = $derived(settings.crossfade === 'true');
+	// A room carries one track and one position, so an overlap cannot be synced: the backend
+	// suspends the fade for as long as we are in one (`AppState::apply_crossfade`). Say so here,
+	// or it reads as crossfade quietly breaking.
+	const crossfadeSuspended = $derived(lt.role !== 'none');
+	// Clamped like the player clamps it (`set_crossfade`), so a stored value from anywhere but this
+	// slider cannot show a number the audio will not use.
+	const crossfadeSecs = $derived.by(() => {
+		const secs = Number(settings.crossfade_secs ?? '5');
+		return Number.isFinite(secs) ? Math.min(10, Math.max(1, secs)) : 5;
+	});
 	const hideVideosOn = $derived(settings.hide_videos === 'true');
 	// Off until the setting is turned on: still experimental, so nobody gets video they didn't ask
 	// for. Same test in `player.svelte.ts`, which hydrates `prefs` at launch.
 	const musicVideosOn = $derived(settings.music_videos === 'true');
-	const boiduOn = $derived(settings.lyrics_boidu !== 'false');
+	// Off by default, and only offered with music videos on: it costs real GPU time on every frame.
+	const ambientOn = $derived(settings.ambient_light === 'true');
 	// Off by default: the full byline is what YouTube credits, and cutting it is a preference
 	// with a real failure mode (a comma-joined duo name), not a fix (issue #231).
 	const lastfmPrimaryOn = $derived(settings.lastfm_primary_artist === 'true');
@@ -312,9 +363,14 @@
 	const preventDuplicatesOn = $derived(settings.prevent_duplicates === 'true');
 	// Off by default: shuffle applies to the queue it was turned on for (issue #117).
 	const stickyShuffleOn = $derived(settings.sticky_shuffle === 'true');
+	// Off by default: shuffle keeps what was added with Add to queue behind the playlist (#369).
+	const shuffleWholeOn = $derived(settings.shuffle_whole_queue === 'true');
 	const updateBannerOn = $derived(settings.update_banner !== 'false');
+	const betaOn = $derived(settings.update_channel === 'beta');
 	const trayOn = $derived(settings.close_to_tray !== 'false');
+	const trackNotificationsOn = $derived(settings.track_notifications === 'true');
 	const autostartOn = $derived(settings.autostart === 'true');
+	const startMinimizedOn = $derived(settings.start_minimized === 'true');
 	// `native_chrome` is read-only and platform-derived (commands.rs). `overlay` is macOS, where the
 	// traffic lights are fixed at window creation and there is nothing to offer the user (#65).
 	const systemTitlebarOn = $derived(settings.native_chrome !== 'off');
@@ -347,9 +403,20 @@
 		await api.setSetting('enable_history', settings.enable_history);
 	}
 
-	async function setAutoplay(on: boolean) {
-		settings.autoplay = on ? 'true' : 'false';
-		await api.setSetting('autoplay', settings.autoplay);
+	// Rust retunes the track that's already playing, so the difference is audible immediately.
+	async function setNormalize(on: boolean) {
+		settings.normalize_volume = on ? 'true' : 'false';
+		await api.setSetting('normalize_volume', settings.normalize_volume);
+	}
+
+	async function setCrossfade(on: boolean) {
+		settings.crossfade = on ? 'true' : 'false';
+		await api.setSetting('crossfade', settings.crossfade);
+	}
+
+	async function setCrossfadeSecs(secs: number) {
+		settings.crossfade_secs = String(secs);
+		await api.setSetting('crossfade_secs', settings.crossfade_secs);
 	}
 
 	// Also lands in `prefs`, which is where the player view reads it: the switch has to take effect
@@ -358,6 +425,13 @@
 		settings.music_videos = on ? 'true' : 'false';
 		prefs.musicVideos = on;
 		await api.setSetting('music_videos', settings.music_videos);
+	}
+
+	// `prefs` after the write: on Linux the write is also what turns WebGL on for the glow.
+	async function setAmbient(on: boolean) {
+		settings.ambient_light = on ? 'true' : 'false';
+		await api.setSetting('ambient_light', settings.ambient_light);
+		prefs.ambient = on;
 	}
 
 	async function setHideVideos(on: boolean) {
@@ -375,11 +449,6 @@
 		await api.setSetting('lastfm_primary_strict', settings.lastfm_primary_strict);
 	}
 
-	async function setBoidu(on: boolean) {
-		settings.lyrics_boidu = on ? 'true' : 'false';
-		await api.setSetting('lyrics_boidu', settings.lyrics_boidu);
-	}
-
 	async function setPreventDuplicates(on: boolean) {
 		settings.prevent_duplicates = on ? 'true' : 'false';
 		await api.setSetting('prevent_duplicates', settings.prevent_duplicates);
@@ -390,14 +459,30 @@
 		await api.setSetting('sticky_shuffle', settings.sticky_shuffle);
 	}
 
+	async function setShuffleWhole(on: boolean) {
+		settings.shuffle_whole_queue = on ? 'true' : 'false';
+		await api.setSetting('shuffle_whole_queue', settings.shuffle_whole_queue);
+	}
+
 	async function setUpdateBanner(on: boolean) {
 		settings.update_banner = on ? 'true' : 'false';
 		await api.setSetting('update_banner', settings.update_banner);
 	}
 
+	async function setBeta(on: boolean) {
+		settings.update_channel = on ? 'beta' : 'stable';
+		await api.setSetting('update_channel', settings.update_channel);
+		await recheckForUpdates();
+	}
+
 	async function setTray(on: boolean) {
 		settings.close_to_tray = on ? 'true' : 'false';
 		await api.setSetting('close_to_tray', settings.close_to_tray);
+	}
+
+	async function setTrackNotifications(on: boolean) {
+		settings.track_notifications = on ? 'true' : 'false';
+		await api.setSetting('track_notifications', settings.track_notifications);
 	}
 
 	// The backend flips the real window decorations; `win.chrome` is what the SPA keys its own
@@ -421,6 +506,16 @@
 			await api.setSetting('autostart', settings.autostart);
 		} catch (e) {
 			settings.autostart = on ? 'false' : 'true'; // registration failed — revert the switch
+			toast.error(String(e));
+		}
+	}
+
+	async function setStartMinimized(on: boolean) {
+		settings.start_minimized = on ? 'true' : 'false';
+		try {
+			await api.setSetting('start_minimized', settings.start_minimized);
+		} catch (e) {
+			settings.start_minimized = on ? 'false' : 'true';
 			toast.error(String(e));
 		}
 	}
@@ -456,6 +551,8 @@
 	title: string;
 	desc?: string;
 	badge?: string;
+	/** After the title and badge, for a small info affordance that belongs to the title. */
+	extra?: Snippet;
 	control?: Snippet;
 	below?: Snippet;
 	tall?: boolean;
@@ -472,6 +569,7 @@
 							{o.badge}
 						</span>
 					{/if}
+					{#if o.extra}{@render o.extra()}{/if}
 				</div>
 				{#if o.desc}
 					<p class="mt-1 max-w-prose text-xs leading-relaxed text-muted-foreground">{o.desc}</p>
@@ -493,7 +591,7 @@
 	     transitioning the width relayouts the whole modal every frame, and WebKitGTK is the webview
 	     that would pay for it. -->
 	<Dialog.Content
-		class="gap-0 overflow-hidden p-0 {tab === 'discord' ? 'sm:max-w-5xl' : 'sm:max-w-3xl'}"
+		class="gap-0 overflow-hidden p-0 {tab === 'discord' ? 'sm:max-w-5xl' : tab === 'hotkeys' ? 'sm:max-w-4xl' : 'sm:max-w-3xl'}"
 	>
 		<Dialog.Description class="sr-only">{t('settings.title')}</Dialog.Description>
 
@@ -540,7 +638,7 @@
 				{#if loaded && tab === 'discord'}
 					<DiscordSettings {settings} />
 				{:else}
-				<div class="min-w-0 flex-1 overflow-y-auto px-6 py-5">
+				<div class="min-w-0 flex-1 overflow-y-auto overflow-x-hidden px-6 py-5">
 					{#if !loaded}
 						<p class="text-sm text-muted-foreground">{t('common.loading')}</p>
 					{:else if tab === 'general'}
@@ -566,7 +664,8 @@
 								{@render row({
 									title: t('settings.general.language'),
 									desc: t('settings.general.language_hint'),
-									control: languagePicker
+									control: languageTrigger,
+									below: langOpen ? languageList : undefined
 								})}
 							</div>
 						</section>
@@ -589,10 +688,22 @@
 									control: traySwitch
 								})}
 								{@render row({
+									title: t('settings.general.track_notifications'),
+									desc: t('settings.general.track_notifications_hint'),
+									control: trackNotificationsSwitch
+								})}
+								{@render row({
 									title: t('settings.general.autostart'),
 									desc: t('settings.general.autostart_hint'),
 									control: autostartSwitch
 								})}
+								{#if autostartOn}
+									{@render row({
+										title: t('settings.general.start_minimized'),
+										desc: t('settings.general.start_minimized_hint'),
+										control: startMinimizedSwitch
+									})}
+								{/if}
 								{#if !systemTitlebarFixed}
 									{@render row({
 										title: t('settings.general.system_titlebar'),
@@ -711,10 +822,33 @@
 									control: qualityPicker
 								})}
 								{@render row({
+									title: t('settings.playback.normalize_volume'),
+									desc: t('settings.playback.normalize_volume_hint'),
+									control: normalizeSwitch,
+									tall: true
+								})}
+								{@render row({
 									title: t('settings.playback.autoplay'),
 									desc: t('settings.playback.autoplay_hint'),
 									control: autoplaySwitch
 								})}
+								{@render row({
+									title: t('settings.playback.crossfade'),
+									badge: t('settings.themes.experimental'),
+									desc: crossfadeSuspended
+										? t('settings.playback.crossfade_lt_paused')
+										: t('settings.playback.crossfade_hint'),
+									control: crossfadeSwitch,
+									tall: true
+								})}
+								{#if crossfadeOn}
+									{@render row({
+										title: t('settings.playback.crossfade_duration'),
+										desc: t('settings.playback.crossfade_duration_hint'),
+										control: crossfadeSlider,
+										tall: true
+									})}
+								{/if}
 								{@render row({
 									title: t('settings.playback.prevent_duplicates'),
 									desc: t('settings.playback.prevent_duplicates_hint'),
@@ -725,6 +859,12 @@
 									title: t('settings.playback.sticky_shuffle'),
 									desc: t('settings.playback.sticky_shuffle_hint'),
 									control: stickyShuffleSwitch,
+									tall: true
+								})}
+								{@render row({
+									title: t('settings.playback.shuffle_whole_queue'),
+									desc: t('settings.playback.shuffle_whole_queue_hint'),
+									control: shuffleWholeSwitch,
 									tall: true
 								})}
 							</div>
@@ -739,6 +879,16 @@
 									control: musicVideoSwitch,
 									tall: true
 								})}
+								{#if musicVideosOn}
+									{@render row({
+										title: t('settings.playback.ambient_light'),
+										badge: t('settings.themes.experimental'),
+										desc: t('settings.playback.ambient_light_hint'),
+										extra: ambientGpu,
+										control: ambientSwitch,
+										tall: true
+									})}
+								{/if}
 								{@render row({
 									title: t('settings.playback.hide_videos'),
 									desc: t('settings.playback.hide_videos_hint'),
@@ -776,16 +926,9 @@
 								{/if}
 							</div>
 						</section>
-						<section class={GROUP}>
+						<section class={GROUP} id="settings-lyrics">
 							<h3 class={LABEL}>{t('settings.sections.lyrics')}</h3>
-							<div class={CARD}>
-								{@render row({
-									title: t('settings.playback.lyrics_provider'),
-									desc: t('settings.playback.lyrics_provider_hint'),
-									control: boiduSwitch,
-									tall: true
-								})}
-							</div>
+							<LyricsSourcesSettings {settings} />
 						</section>
 						<section class={GROUP}>
 							<h3 class={LABEL}>{t('settings.sections.advanced')}</h3>
@@ -793,6 +936,8 @@
 								{@render row({ title: t('settings.general.stream_clients'), below: clientList })}
 							</div>
 						</section>
+					{:else if tab === 'hotkeys'}
+						<GlobalHotkeysSettings />
 					{:else if tab === 'remote'}
 						<RemoteSettings />
 					{:else if tab === 'data'}
@@ -853,9 +998,9 @@
 								{@render row({
 									title: t('settings.about.check_updates'),
 									desc: updateState.available && !updateState.canInstall
-										? `${t('settings.about.update_available', { version: updateState.available.version })} ${t('settings.about.update_packaged')}`
+										? `${availableMessage(updateState.available)} ${t('settings.about.update_packaged')}`
 										: updateState.available
-											? t('settings.about.update_available', { version: updateState.available.version })
+											? availableMessage(updateState.available)
 											: t('settings.about.up_to_date'),
 									control: updateButton,
 									below: updateResult && !updateState.available ? updateAlert : undefined
@@ -866,6 +1011,14 @@
 									control: bannerSwitch,
 									tall: true
 								})}
+								{#if betaAvailable}
+									{@render row({
+										title: t('settings.about.beta'),
+										desc: t('settings.about.beta_hint'),
+										control: betaSwitch,
+										tall: true
+									})}
+								{/if}
 							</div>
 						</section>
 
@@ -911,33 +1064,68 @@
 </Dialog.Root>
 
 <!-- Controls. Split out so the rows above read as a list of settings rather than a wall of markup. -->
-{#snippet languagePicker()}
-	<Select.Root
-		type="single"
-		value={currentLocale.id}
-		onValueChange={(v) => setLocale(v as LocaleId)}
+<!-- Picking refreshes the page behind the dialog once Rust has the new language: half of what is on
+     screen is YouTube's own text (#274), and that half only changes on the next fetch. -->
+{#snippet languageTrigger()}
+	<button
+		type="button"
+		onclick={() => (langOpen = !langOpen)}
+		aria-expanded={langOpen}
+		aria-label="{t('settings.general.language')}: {currentLocaleLabel}"
+		class="flex h-9 w-44 shrink-0 cursor-pointer items-center gap-2 rounded-4xl border border-input bg-input/30 px-3 text-sm transition-colors hover:bg-input/50"
 	>
-		<Select.Trigger class="w-44 shrink-0" aria-label={t('settings.general.language')}>
-			<span class="flex-1 truncate text-left">{currentLocaleLabel}</span>
-		</Select.Trigger>
-		<Select.Content>
-			{#each LOCALES as locale (locale.id)}
-				<Select.Item value={locale.id} label={locale.nativeLabel}>
-					{locale.nativeLabel}
-				</Select.Item>
-			{/each}
-		</Select.Content>
-	</Select.Root>
+		<HugeiconsIcon icon={Globe02Icon} strokeWidth={2} class="size-4 shrink-0 text-muted-foreground" />
+		<span class="flex-1 truncate text-left">{currentLocaleLabel}</span>
+		<HugeiconsIcon
+			icon={ArrowDown01Icon}
+			strokeWidth={2}
+			class="size-4 shrink-0 text-muted-foreground transition-transform {langOpen ? 'rotate-180' : ''}"
+		/>
+	</button>
+{/snippet}
+
+{#snippet languageList()}
+	<LanguagePicker
+		onclose={() => (langOpen = false)}
+		onpick={(id) => {
+			langOpen = false;
+			setLocale(id).then(refreshView);
+		}}
+	/>
 {/snippet}
 
 {#snippet historySwitch()}<Switch checked={historyOn} onCheckedChange={setHistory} />{/snippet}
 {#snippet traySwitch()}<Switch checked={trayOn} onCheckedChange={setTray} />{/snippet}
+{#snippet trackNotificationsSwitch()}<Switch
+		checked={trackNotificationsOn}
+		onCheckedChange={setTrackNotifications}
+	/>{/snippet}
 {#snippet autostartSwitch()}<Switch checked={autostartOn} onCheckedChange={setAutostart} />{/snippet}
+{#snippet startMinimizedSwitch()}<Switch checked={startMinimizedOn} onCheckedChange={setStartMinimized} />{/snippet}
 {#snippet systemTitlebarSwitch()}<Switch
 		checked={systemTitlebarOn}
 		onCheckedChange={setSystemTitlebar}
 	/>{/snippet}
-{#snippet autoplaySwitch()}<Switch checked={autoplayOn} onCheckedChange={setAutoplay} />{/snippet}
+{#snippet autoplaySwitch()}<Switch checked={prefs.autoplay} onCheckedChange={setAutoplay} />{/snippet}
+
+{#snippet crossfadeSwitch()}<Switch checked={crossfadeOn} onCheckedChange={setCrossfade} />{/snippet}
+
+{#snippet crossfadeSlider()}
+	<div class="flex w-44 shrink-0 items-center gap-3">
+		<Slider
+			type="single"
+			aria-label={t('settings.playback.crossfade_duration')}
+			min={1}
+			max={10}
+			step={1}
+			value={crossfadeSecs}
+			onValueChange={setCrossfadeSecs}
+		/>
+		<span class="w-8 shrink-0 text-right font-mono text-xs text-muted-foreground">
+			{t('settings.playback.crossfade_seconds', { secs: crossfadeSecs })}
+		</span>
+	</div>
+{/snippet}
 {#snippet dupSwitch()}<Switch
 		checked={preventDuplicatesOn}
 		onCheckedChange={setPreventDuplicates}
@@ -946,7 +1134,47 @@
 		checked={stickyShuffleOn}
 		onCheckedChange={setStickyShuffle}
 	/>{/snippet}
+{#snippet shuffleWholeSwitch()}<Switch
+		checked={shuffleWholeOn}
+		onCheckedChange={setShuffleWhole}
+	/>{/snippet}
+{#snippet normalizeSwitch()}<Switch checked={normalizeOn} onCheckedChange={setNormalize} />{/snippet}
 {#snippet musicVideoSwitch()}<Switch checked={musicVideosOn} onCheckedChange={setMusicVideos} />{/snippet}
+{#snippet ambientSwitch()}<Switch checked={ambientOn} onCheckedChange={setAmbient} />{/snippet}
+<!-- The GPU note, behind a warning glyph by the title: it matters to the few whose card is weak,
+     and a paragraph under the switch read as a reason not to try it. A popover rather than a
+     tooltip, so it opens on a click or a key and can hold the link. -->
+{#snippet ambientGpu()}
+	<Popover.Root>
+		<Popover.Trigger
+			class="-m-1 cursor-pointer rounded-md p-1 text-muted-foreground transition-colors hover:text-foreground data-[state=open]:text-foreground"
+			aria-label={t('settings.playback.ambient_light_gpu_title')}
+			title={t('settings.playback.ambient_light_gpu_title')}
+		>
+			<HugeiconsIcon icon={Alert02Icon} size={14} strokeWidth={1.8} />
+		</Popover.Trigger>
+		<Popover.Content side="top" align="start" class="w-80 gap-3">
+			<div class="flex items-start gap-2.5">
+				<HugeiconsIcon icon={Alert02Icon} size={16} strokeWidth={1.8} class="mt-0.5 shrink-0" />
+				<div class="min-w-0">
+					<p class="text-sm font-semibold">{t('settings.playback.ambient_light_gpu_title')}</p>
+					<p class="mt-1 text-xs leading-relaxed text-muted-foreground">
+						{t('settings.playback.ambient_light_gpu')}
+					</p>
+				</div>
+			</div>
+			<Button
+				variant="secondary"
+				size="sm"
+				class="self-start"
+				onclick={() => api.openExternal('https://www.videocardbenchmark.net/gpu_list.php')}
+			>
+				<HugeiconsIcon icon={LinkSquare02Icon} size={15} strokeWidth={1.8} />
+				{t('settings.playback.ambient_light_gpu_check')}
+			</Button>
+		</Popover.Content>
+	</Popover.Root>
+{/snippet}
 {#snippet hideVideoSwitch()}<Switch checked={hideVideosOn} onCheckedChange={setHideVideos} />{/snippet}
 {#snippet lastfmPrimarySwitch()}<Switch
 		checked={lastfmPrimaryOn}
@@ -956,8 +1184,8 @@
 		checked={lastfmStrictOn}
 		onCheckedChange={setLastfmStrict}
 	/>{/snippet}
-{#snippet boiduSwitch()}<Switch checked={boiduOn} onCheckedChange={setBoidu} />{/snippet}
 {#snippet bannerSwitch()}<Switch checked={updateBannerOn} onCheckedChange={setUpdateBanner} />{/snippet}
+{#snippet betaSwitch()}<Switch checked={betaOn} onCheckedChange={setBeta} />{/snippet}
 {#snippet openPlayerSwitch()}<Switch
 		checked={appearance.openPlayerOnPlay}
 		onCheckedChange={(on) => setAppearance({ openPlayerOnPlay: on })}

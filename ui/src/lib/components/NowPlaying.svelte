@@ -18,14 +18,21 @@
 	} from '@hugeicons/core-free-icons';
 	import * as Tabs from '$lib/components/ui/tabs';
 	import * as api from '$lib/api';
-	import { np, playback, ui, wheelVolume } from '$lib/player.svelte';
-	import { canVideo, claimVideo, parkVideo, showVideo, video } from '$lib/video.svelte';
+	import { np, playback, prefs, ui, wheelVolume } from '$lib/player.svelte';
+	import {
+		canVideo,
+		claimVideo,
+		parkVideo,
+		setHole,
+		showVideo,
+		video
+	} from '$lib/video.svelte';
 	import { appearance } from '$lib/theme.svelte';
 	import { t } from '$lib/i18n.svelte';
 	import { thumb } from '$lib/thumb';
 	import QueueList from './QueueList.svelte';
-	import type { QueueScrollMemory } from '$lib/queue-history';
 	import LyricsView from './LyricsView.svelte';
+	import Ambient from './Ambient.svelte';
 
 	// Off in settings, this view drops its tabs and the queue/lyrics panels stay in charge of both
 	// (see +layout): they paint above this (z-30 over z-20), so all this needs is to hand back the
@@ -33,8 +40,6 @@
 	// a scrimmed overlay and there's nothing to shrink into. In tabbed mode both are always closed.
 	let { queueOpen, lyricsOpen }: { queueOpen: boolean; lyricsOpen: boolean } = $props();
 	const tabbed = $derived(appearance.tabbedPlayer);
-	// Survives queue/lyrics tab switches without keeping an inactive queue mounted.
-	const queueScrollMemory: QueueScrollMemory = {};
 	// ponytail: mirrors QueuePanel / LyricsPanel's w-80, keep in sync if those change.
 	const panels = $derived(Number(queueOpen) + Number(lyricsOpen));
 	const inset = $derived(['', 'lg:right-80', 'lg:right-[40rem]'][panels]);
@@ -43,10 +48,27 @@
 	// it back. beforeNavigate (not a pathname effect) so clicking the tab you're already on counts.
 	beforeNavigate(() => (np.open = false));
 
+	// Clicking the empty space around the artwork closes the view (#302), the way a dialog's
+	// backdrop does. `data-np-keep` marks the two regions that own their clicks: the artwork itself
+	// and the queue/lyrics column. Anything added straight to the view outside those closes it.
+	// Same press-not-release rule as the player bar: dragging a queue row (or a lyrics scroll) and
+	// releasing over the backdrop retargets the click at the common ancestor, which is this. Both
+	// ends of the drag are checked, because the retarget happens whichever way it ran: a selection
+	// started on the backdrop and finished over the lyrics lands the click here too.
+	const keeps = (t: EventTarget | null) => !!(t as Element | null)?.closest?.('[data-np-keep]');
+	let pressedKeep = false;
+	let releasedKeep = false;
+	function onBackdropClick(e: MouseEvent) {
+		if (pressedKeep || releasedKeep || keeps(e.target)) return;
+		np.open = false;
+	}
+
 	// Enlarged lyrics take the whole view, artwork column and tab strip included. A class swap
 	// rather than unmounting the tabs: LyricsView must survive it or it refetches and loses its
 	// scroll position.
 	let big = $state(false);
+	/** The picture's box, for the ambient light to glow around. */
+	let picBox = $state<HTMLElement | null>(null);
 	$effect(() => {
 		if (np.tab !== 'lyrics') big = false; // nothing to enlarge on the queue tab
 	});
@@ -89,6 +111,54 @@
 		volTimer = setTimeout(() => (volFlash = false), 1000);
 	}
 
+	// Linux: the picture is drawn by mpv underneath the page, and the box below is a hole it shows
+	// through (src-tauri/src/nativevideo.rs). Not while the view flies in or out: the box moves every
+	// frame then, and the picture underneath cannot follow. The end of the fly is what settles it,
+	// never a timer: the fly starts only once the view's first frame is out, so after a slow one a
+	// 340 ms timer measured the box mid-flight, and a transform fires no observer to correct it
+	// (the picture sat 186 px low). Reopened mid-flight out, the view is the same component flying
+	// back in, and that fly's end settles it the same way.
+	// Closing pauses this component, and a paused component runs no effects or class updates until
+	// the fly is over, so the picture stayed up for all of it. The outro's start is an event, which
+	// still fires: it takes the hole away itself, and `inert:` (Svelte sets it on the view for the
+	// fly out) paints the view and the box over the picture meanwhile.
+	let settled = $state(false);
+	let view: HTMLElement;
+	$effect(() => {
+		// Mounted without a fly (the intro only plays when the view itself opens), so no introend
+		// is coming. By the first frame Svelte has started the fly if there is one.
+		const frame = requestAnimationFrame(() => {
+			if (!view.getAnimations().length) settled = true;
+		});
+		return () => cancelAnimationFrame(frame);
+	});
+
+	/** Report the hole's box whenever it moves, and none while the window is hidden (the tray, the
+	 *  mini player): mpv then stops decoding the picture, and picks it up in step on the way back. */
+	function holeFor(el: HTMLElement) {
+		// Theater mode paints over the whole window, so nobody would see the picture.
+		if (!settled || ui.theaterOpen) return;
+		const measure = () => {
+			if (document.hidden) return setHole(null);
+			const r = el.getBoundingClientRect();
+			setHole({ x: r.left, y: r.top, w: r.width, h: r.height });
+		};
+		// The box, the window, and this view: every layout change that moves the box also resizes
+		// one of them. The view is the one that only moves it: collapsing the sidebar widens the view
+		// and slides the box over at the same size, which left the picture where the box had been.
+		const ro = new ResizeObserver(measure);
+		ro.observe(el);
+		ro.observe(document.documentElement);
+		const view = el.closest('[data-np-view]');
+		if (view) ro.observe(view);
+		document.addEventListener('visibilitychange', measure);
+		return () => {
+			ro.disconnect();
+			document.removeEventListener('visibilitychange', measure);
+			setHole(null);
+		};
+	}
+
 </script>
 
 <!-- Covers the page but not the sidebar (you navigate away to minimise) and not the player bar,
@@ -98,9 +168,21 @@
      The player bar and the queue/lyrics panels come later/higher, so they still paint above.
      ponytail: left offsets mirror Sidebar's w-16/lg:w-60 (and its manual collapse) — keep in sync
      if those change. -->
+<!-- The player bar's chevron (and E) is the keyboard equivalent of clicking the backdrop, so this
+     stays a plain region rather than a control wrapping the whole view. -->
+<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
 <div
 	transition:fly={{ y: '100%', duration: 320, easing: cubicOut }}
-	class="absolute inset-y-0 left-16 right-0 z-20 flex justify-center overflow-hidden bg-background px-4 py-4 sm:px-6 sm:py-6 lg:px-10 {ui.sidebarCollapsed
+	onoutrostart={() => ((settled = false), setHole(null))}
+	onintroend={() => (settled = true)}
+	bind:this={view}
+	onpointerdown={(e) => ((pressedKeep = keeps(e.target)), (releasedKeep = false))}
+	onpointerup={(e) => (releasedKeep = keeps(e.target))}
+	onclick={onBackdropClick}
+	data-np-view
+	class="absolute inset-y-0 left-16 right-0 z-20 flex justify-center overflow-hidden px-4 py-4 inert:bg-background {video.hole
+		? ''
+		: 'bg-background'} sm:px-6 sm:py-6 lg:px-10 {ui.sidebarCollapsed
 		? ''
 		: 'lg:left-60'} {inset}"
 >
@@ -119,6 +201,11 @@
 	     translateZ(0) and contain:paint all measured as noise), and the cost tracks the blur
 	     radius rather than the image. A video fills the view on its own, so there is nothing to
 	     replace it with. -->
+	<!-- The ambient light (Settings > Video): the video's colours spilling into the view around it. Not
+	     under theater mode, which covers this view, and not with the lyrics enlarged over the picture. -->
+	{#if prefs.ambient && showVideo() && picBox && !ui.theaterOpen}
+		<Ambient box={picBox} />
+	{/if}
 	{#if appearance.artworkBackground && !showVideo() && srcs[2] && !bgFailed}
 		<img
 			src={srcs[2]}
@@ -155,8 +242,10 @@
 				     button rather than nested inside it (nested buttons are invalid HTML and the
 				     inner one never reliably gets the click). -->
 				<div
+					bind:this={picBox}
 					class="relative w-full {showVideo() ? 'max-w-[var(--vid)]' : 'max-w-[var(--art)]'}"
 					onwheel={onWheel}
+					data-np-keep
 				>
 					{#if volFlash}
 						<!-- Middle left of the artwork, on a plate: it sits over whatever the picture is,
@@ -178,7 +267,8 @@
 									style="height:{playback.volume}%"
 								></div>
 							</div>
-							<span class="text-[10px] tabular-nums">{playback.volume}</span>
+							<!-- Three digits wide at every level, or the plate grows a few px at 100 (#336). -->
+							<span class="w-[3ch] text-center text-[10px] tabular-nums">{playback.volume}</span>
 						</div>
 					{/if}
 					<button
@@ -210,13 +300,24 @@
 						     being closed, and this is where it gets moved to while the view is open.
 						     `display: contents` so the wrapper generates no box of its own and the video's
 						     `w-full` still resolves against the button. -->
-						<div
-							class="contents"
-							{@attach (box: HTMLElement) => {
-								claimVideo(box);
-								return parkVideo;
-							}}
-						></div>
+						{#if prefs.nativeVideo}
+							<!-- Transparent once the picture is up (+layout paints everything around it),
+							     black until then, and black again while the view flies out. -->
+							{#if showVideo()}
+								<div
+									class="aspect-video w-full rounded-2xl inert:bg-black {video.hole ? '' : 'bg-black'}"
+									{@attach holeFor}
+								></div>
+							{/if}
+						{:else}
+							<div
+								class="contents"
+								{@attach (box: HTMLElement) => {
+									claimVideo(box);
+									return parkVideo;
+								}}
+							></div>
+						{/if}
 						<!-- The artwork, when the video above isn't the picture. Both arms carry the same
 						     guard rather than nesting, so the branch below keeps its indentation. -->
 						{#if !showVideo() && src && attempt < srcs.length}
@@ -262,7 +363,10 @@
 		{/if}
 
 		{#if tabbed}
-			<div class="flex min-h-0 flex-col {big ? 'flex-1' : 'w-full md:w-[22rem] xl:w-[26rem]'}">
+			<div
+				class="flex min-h-0 flex-col {big ? 'flex-1' : 'w-full md:w-[22rem] xl:w-[26rem]'}"
+				data-np-keep
+			>
 				<Tabs.Root
 					value={np.tab}
 					onValueChange={(v) => (np.tab = v as typeof np.tab)}
@@ -298,7 +402,7 @@
 					     leave LyricsView fetching lyrics for every track you never asked to see. -->
 					{#if np.tab === 'queue'}
 						<Tabs.Content value="queue" class="flex min-h-0 flex-col">
-							<QueueList scrollMemory={queueScrollMemory} />
+							<QueueList />
 						</Tabs.Content>
 					{:else}
 						<Tabs.Content value="lyrics" class="flex min-h-0 flex-col">

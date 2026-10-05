@@ -26,6 +26,7 @@ tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-autostart = "2"
+tauri-plugin-global-shortcut = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 # Phase 2 extraction stack (cipher + PoToken). context/04, 05, 13.
 # BotGuard runs under deno_core + JSDOM, NOT in a hidden webview. Every token a real browser engine
@@ -63,6 +64,23 @@ lofty = "0.22.2"
 tauri-plugin-dialog = "2.7.2"
 tauri-plugin-window-state = "2.4.1"
 tauri-plugin-clipboard-manager = "2.3.2"
+# Romanized lyrics (#202, romanize.rs). lindera's build script downloads IPADIC (~12 MB, from
+# GitHub) once and embeds it uncompressed (~45 MB in the binary, borrowed in place, never copied to
+# the heap); rust-cache keeps it across CI runs. Held at 0.30: every lindera from 0.35 on needs
+# encoding_rs >= 0.8.35, and rustypipe-botguard's deno_web pins =0.8.33. 0.31 to 0.34 fetch
+# IPADIC from hosts that are gone. Move up when botguard does.
+lindera = { version = "=0.30.0", default-features = false, features = ["ipadic"] }
+wana_kana = { version = "5", default-features = false }
+pinyin = { version = "0.11", default-features = false, features = ["with_tone"] }
+any_ascii = "0.3"
+# Track-change notifications (notify.rs): D-Bus on Linux, WinRT toasts, NSUserNotification.
+notify-rust = "4"
+# Spotify import (#375, spotify.rs + import.rs). All four were in the lockfile already: zip under
+# the Windows updater, csv and unicode-normalization under lindera, strsim under clap.
+zip = { version = "4", default-features = false, features = ["deflate-flate2"] }
+csv = "1"
+strsim = "0.11"
+unicode-normalization = "0.1"
 
 # Taskbar thumbnail toolbar (#47). Same `windows` version tauri-runtime-wry already pulls in, so
 # `Window::hwnd()` hands us a matching HWND.
@@ -76,7 +94,11 @@ windows = { version = "0.61", features = [
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# The music video's GL surface under the webview (nativevideo.rs). Same version tauri pulls in.
+gtk = "0.18"
 ksni = "0.3.6"
 libc = "0.2"
 # Reaching the WebKitGTK settings wry leaves at browser defaults. Must track wry's version.
 webkit2gtk = { version = "2.0", features = ["v2_40"] }
+# Holding off suspend while playing (inhibit.rs, #347). Already in the tree through notify-rust.
+zbus = "5"

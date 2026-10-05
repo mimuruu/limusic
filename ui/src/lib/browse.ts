@@ -3,10 +3,9 @@
 // thing" can never drift apart between two components.
 import { goto } from '$app/navigation';
 import * as api from './api';
-import type { BrowseItem, SearchResults, SongItem } from './api';
-import { getCached, putCached } from './pagecache';
+import type { BrowseItem, SongItem } from './api';
 import { t } from './i18n.svelte';
-import { enqueue, playFrom, playSong, toast, touchPick } from './player.svelte';
+import { enqueue, openAddManyToPlaylist, playFrom, playSong, toast, touchPick } from './player.svelte';
 
 /**
  * A song card carries everything a queue entry needs; the ⋯ menus take this shape. The one mapping
@@ -23,6 +22,8 @@ export const asSong = (i: BrowseItem): SongItem => ({
 	artist_runs: i.artistRuns,
 	artist_id: i.artistRuns?.find((r) => r.id)?.id,
 	duration: i.duration,
+	// Without it the card's ⋯ menu, and the player bar once it plays, have no "Go to album".
+	album_id: i.albumId,
 	play_count: i.playCount,
 	thumbnail: i.thumbnail,
 	explicit: i.explicit,
@@ -114,33 +115,41 @@ export async function enqueueItem(item: BrowseItem, next: boolean): Promise<void
 }
 
 /**
- * The handful of rows a typeahead shows for a query: one top hit, then a spread across the
- * categories rather than six songs. Cache-first, and it writes the same `search:<q>` key the search
- * page reads, so previewing a query and then running it doesn't search twice. Shared by the search
- * field (SearchSuggest) and the Ctrl+K palette, which is what keeps the two showing the same rows.
+ * Save the whole thing to a playlist without opening it: fetch the tracks, then hand them to the
+ * picker. Same contract as `enqueueItem` - callers own the in-flight state, and a failure toasts
+ * rather than throwing.
+ *
+ * ponytail: the first page only. `enqueueItem` passes a playlist's `continuation` to the backend,
+ * which walks the rest into the queue; the add path has no equivalent, so a very long playlist
+ * copies the tracks that came back, and says so rather than quietly dropping the rest. Walk the
+ * pages here if someone asks for the whole 500.
  */
-export async function searchPreview(q: string): Promise<BrowseItem[]> {
-	const key = `search:${q}`;
-	let res = getCached<SearchResults>(key);
-	if (!res) {
-		res = await api.searchAll(q);
-		putCached(key, res);
+export async function addItemToPlaylist(item: BrowseItem): Promise<void> {
+	if (item.kind === 'song') {
+		openAddManyToPlaylist([asSong(item)]);
+		return;
 	}
-	const out: BrowseItem[] = [];
-	const seen = new Set<string>();
-	const take = (from: BrowseItem[], n: number) => {
-		for (const i of from) {
-			if (n <= 0) break;
-			if (seen.has(i.id)) continue;
-			seen.add(i.id);
-			out.push(i);
-			n--;
-		}
+	try {
+		const src =
+			item.kind === 'album' ? await api.getAlbum(item.id) : await api.getPlaylist(item.id);
+		if (src.continuation) toast.error(t('toasts.partial_playlist_added'));
+		openAddManyToPlaylist(src.items);
+	} catch {
+		toast.error(t('toasts.could_not_add'));
+	}
+}
+
+/**
+ * The second line of a typeahead row. A song's subtitle is its artists alone, so it gets "Song"
+ * in front. Every other row's already opens with YouTube's own "Album" or "Artist", and prefixing
+ * our label as well read "Album • Album • Édith Piaf".
+ */
+export function rowMeta(i: BrowseItem): string {
+	if (i.kind === 'song') return [t('common.song_singular'), i.subtitle].filter(Boolean).join(' • ');
+	const kind: Record<string, string> = {
+		album: t('common.album_singular'),
+		artist: t('common.artist_singular'),
+		playlist: t('common.playlist_singular')
 	};
-	take(res.top, 1);
-	take(res.songs, 3);
-	take(res.artists, 1);
-	take(res.albums, 1);
-	take(res.playlists, 1);
-	return out;
+	return i.subtitle || kind[i.kind] || '';
 }

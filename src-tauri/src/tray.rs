@@ -27,12 +27,17 @@ pub use imp::{init, set_icon, set_playing};
 /// (i3bar, dwm, xfce4-panel without its SNI plugin) runs no `StatusNotifierWatcher` at all, so
 /// registration fails and no icon ever appears (#232). Closing to a tray that isn't there leaves
 /// the app running with no window and no way back except a second launch, so ✕ checks this before
-/// hiding. Optimistic: only the Linux backend ever clears it, once it knows there is no watcher.
+/// hiding. Optimistic: cleared by the Linux backend once it knows there is no watcher, and by
+/// [`set_available`] when `init` fails.
 static AVAILABLE: AtomicBool = AtomicBool::new(true);
 
 /// Can the window be brought back from the tray? See [`AVAILABLE`].
 pub fn available() -> bool {
     AVAILABLE.load(Ordering::Relaxed)
+}
+
+pub fn set_available(val: bool) {
+    AVAILABLE.store(val, Ordering::Relaxed);
 }
 
 /// Bring the main window back from close-to-tray, minimize, or the mini player. Every "come back"
@@ -272,7 +277,7 @@ mod imp {
                 }
             });
         if let Some(icon) = crate::appicon::current(app) {
-            builder = builder.icon(icon);
+            builder = builder.icon(sized(&icon));
         }
         builder.build(app)?;
 
@@ -288,8 +293,24 @@ mod imp {
 
     pub fn set_icon(app: &AppHandle, icon: &tauri::image::Image<'_>) {
         if let Some(tray) = app.tray_by_id("main") {
-            let _ = tray.set_icon(Some(icon.clone()));
+            let _ = tray.set_icon(Some(sized(icon)));
         }
+    }
+
+    /// Windows draws the notification area at `SM_CXSMICON` and stretches anything else without
+    /// filtering (`tray-icon` builds the HICON at whatever size it is handed), so resample first.
+    /// That is half of #225: the bundled fallback was a 32px `.ico` entry, a custom icon up to
+    /// 1024px, and neither is what the tray draws at.
+    #[cfg(target_os = "windows")]
+    fn sized(icon: &tauri::image::Image<'_>) -> tauri::image::Image<'static> {
+        let s = crate::taskbar::tray_icon_size();
+        crate::appicon::scaled(icon, s, s)
+    }
+
+    /// macOS sets the NSImage's size itself, so there this is a copy and nothing more.
+    #[cfg(not(target_os = "windows"))]
+    fn sized(icon: &tauri::image::Image<'_>) -> tauri::image::Image<'static> {
+        icon.clone().to_owned()
     }
 }
 

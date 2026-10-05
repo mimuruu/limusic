@@ -5,8 +5,8 @@ use serde::Serialize;
 use crate::blocklist;
 use crate::clients::YouTubeClient;
 use crate::models::browse::{
-    self, AlbumPage, ArtistPage, BrowseItem, HistoryGroup, HomePage, PlaylistContinuation,
-    PlaylistPage, PlaylistSort, SearchResults,
+    self, AlbumPage, ArtistPage, BrowseItem, HistoryGroup, HomePage, MoodSection,
+    PlaylistContinuation, PlaylistPage, PlaylistSort, SearchResults, SearchSuggestions,
 };
 use crate::models::context::Context;
 use crate::models::lyrics::{self, PlainLyrics, TimedLyricLine};
@@ -20,6 +20,7 @@ use crate::transport::{Error, InnerTube};
 
 /// Search filter params (opaque base64). context/08.
 pub const FILTER_SONG: &str = "EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D";
+pub const FILTER_VIDEO: &str = "EgWKAQIQAWoKEAkQChAFEAMQBA%3D%3D";
 pub const FILTER_ALBUM: &str = "EgWKAQIYAWoKEAkQChAFEAMQBA%3D%3D";
 pub const FILTER_ARTIST: &str = "EgWKAQIgAWoKEAkQChAFEAMQBA%3D%3D";
 pub const FILTER_COMMUNITY_PLAYLIST: &str = "EgeKAQQoAEABagoQAxAEEAoQCRAF";
@@ -143,6 +144,24 @@ impl InnerTube {
         Ok(r)
     }
 
+    /// Search video uploads only (`FILTER_VIDEO`): the covers, live sets and remixes that never
+    /// got an official release, which `FILTER_SONG` cannot return by definition (#209, #266).
+    /// context/08.
+    pub async fn search_videos(
+        &self,
+        metadata_client: &YouTubeClient,
+        query: &str,
+    ) -> Result<SearchResult, Error> {
+        // Not a filter on the rows, a refusal to ask: with music videos hidden there is no such
+        // thing as a video search, and the caller's shelf disappears on an empty list.
+        if self.hide_videos() {
+            return Ok(SearchResult { items: Vec::new() });
+        }
+        // No history: the search page already recorded this query with its other two searches.
+        let value = self.search_raw(metadata_client, query, Some(FILTER_VIDEO), false).await?;
+        Ok(metadata::parse_search(&value))
+    }
+
     /// Unfiltered search → categorized sections (top / songs / albums / artists / playlists).
     pub async fn search_all(
         &self,
@@ -154,6 +173,29 @@ impl InnerTube {
         let mut r = browse::parse_search_all(&value);
         self.drop_video_cards(&mut r.top);
         self.drop_video_cards(&mut r.songs);
+        Ok(r)
+    }
+
+    /// Typeahead for the search field and Ctrl+K: query completions plus a few matching songs,
+    /// artists and albums. context/08.
+    ///
+    /// Sent with the account, unlike a preview `search` (#203): this is the request YTM's own
+    /// search box sends signed in on every keystroke, so it is not written to search history, and
+    /// the account is what ranks the user's own listening first and returns their past searches.
+    pub async fn search_suggestions(
+        &self,
+        client: &YouTubeClient,
+        input: &str,
+    ) -> Result<SearchSuggestions, Error> {
+        #[derive(Serialize)]
+        struct Body {
+            context: Context,
+            input: String,
+        }
+        let body = Body { context: self.context_for(client), input: input.to_owned() };
+        let value = self.post("music/get_search_suggestions", client, &body, true).await?;
+        let mut r = browse::parse_search_suggestions(&value);
+        self.drop_video_cards(&mut r.items);
         Ok(r)
     }
 
@@ -425,6 +467,14 @@ impl InnerTube {
         Ok(page)
     }
 
+    /// Moods & Genres (`FEmusic_moods_and_genres`): the tiles the search page browses from. A tile's
+    /// `params` opens its playlists via `browse_grid("FEmusic_moods_and_genres_category", ..)`.
+    /// Works signed out. context/08.
+    pub async fn moods(&self, client: &YouTubeClient) -> Result<Vec<MoodSection>, Error> {
+        let value = self.browse(client, Some("FEmusic_moods_and_genres"), None).await?;
+        Ok(browse::parse_moods(&value))
+    }
+
     /// Play history (`FEmusic_history`), in YouTube's own date buckets (Today, Yesterday, …).
     /// context/08. Needs login: signed out, YouTube has nothing to return.
     pub async fn history(&self, client: &YouTubeClient) -> Result<Vec<HistoryGroup>, Error> {
@@ -477,6 +527,10 @@ impl InnerTube {
     ) -> Result<PlaylistPage, Error> {
         let params = sort.map(|(s, desc)| s.params(desc));
         let value = self.browse(client, Some(browse_id), params).await?;
+        if let Some(show) = browse::podcast_show_id(browse_id, &value) {
+            let value = self.browse(client, Some(&show), params).await?;
+            return Ok(browse::parse_playlist(&value));
+        }
         Ok(browse::parse_playlist(&value))
     }
 
@@ -562,6 +616,12 @@ impl InnerTube {
     ) -> Result<Vec<BrowseItem>, Error> {
         let value = self.browse(client, Some(browse_id), params).await?;
         let mut items = browse::parse_library(&value);
+        // A mood category is several shelves flattened into one grid, and YouTube puts the same
+        // playlist on more than one of them (Chill had 85 repeats). A repeat is fatal on the UI
+        // side for the same reason as in `library_grid`: the grid is keyed, and one duplicate key
+        // leaves the page on its skeleton forever. Issue #355.
+        let mut seen = std::collections::HashSet::new();
+        items.retain(|i| seen.insert(i.id.clone()));
         self.drop_video_cards(&mut items);
         self.drop_blocked_cards(&mut items);
         Ok(items)
@@ -717,25 +777,35 @@ impl InnerTube {
     /// Add a video to a playlist. context/01 `browse/edit_playlist`.
     ///
     /// Returns `false` when the track is already in the playlist: YouTube refuses the add (see
-    /// `edit_rejection`) rather than storing a second copy.
+    /// `edit_rejection`) rather than storing a second copy, unless `allow_duplicates` asks for one.
     pub async fn playlist_add(
         &self,
         client: &YouTubeClient,
         playlist_id: &str,
         video_id: &str,
+        allow_duplicates: bool,
     ) -> Result<bool, Error> {
         match self
-            .edit_playlist(
-                client,
-                playlist_id,
-                serde_json::json!({ "action": "ACTION_ADD_VIDEO", "addedVideoId": video_id }),
-            )
+            .edit_playlist(client, playlist_id, add_video_action(video_id, allow_duplicates))
             .await
         {
             Ok(()) => Ok(true),
             Err(Error::AlreadyInPlaylist) => Ok(false),
             Err(e) => Err(e),
         }
+    }
+
+    /// Add many videos in one `browse/edit_playlist` call, in order. The edit is all or nothing,
+    /// and one track the playlist already holds fails the whole batch (`edit_rejection`), so the
+    /// caller passes only videos it knows are new. Used by the Spotify import (#375).
+    pub async fn playlist_add_many(
+        &self,
+        client: &YouTubeClient,
+        playlist_id: &str,
+        video_ids: &[String],
+    ) -> Result<(), Error> {
+        let actions = video_ids.iter().map(|v| add_video_action(v, false)).collect();
+        self.edit_playlist_actions(client, playlist_id, actions).await
     }
 
     /// Remove a video from a playlist. Needs `set_video_id` (the item's playlistSetVideoId).
@@ -746,16 +816,35 @@ impl InnerTube {
         video_id: &str,
         set_video_id: &str,
     ) -> Result<(), Error> {
-        self.edit_playlist(
+        self.playlist_remove_many(
             client,
             playlist_id,
-            serde_json::json!({
-                "action": "ACTION_REMOVE_VIDEO",
-                "setVideoId": set_video_id,
-                "removedVideoId": video_id,
-            }),
+            &[(video_id.to_owned(), set_video_id.to_owned())],
         )
         .await
+    }
+
+    /// Remove several videos in one `edit_playlist` request: the endpoint takes an array of
+    /// actions, so a bulk removal is one round trip rather than one per track.
+    // ponytail: no chunking. YouTube has taken a few hundred actions in one body; split into
+    // batches here if a very long selection ever comes back rejected.
+    pub async fn playlist_remove_many(
+        &self,
+        client: &YouTubeClient,
+        playlist_id: &str,
+        tracks: &[(String, String)],
+    ) -> Result<(), Error> {
+        let actions = tracks
+            .iter()
+            .map(|(video_id, set_video_id)| {
+                serde_json::json!({
+                    "action": "ACTION_REMOVE_VIDEO",
+                    "setVideoId": set_video_id,
+                    "removedVideoId": video_id,
+                })
+            })
+            .collect();
+        self.edit_playlist_actions(client, playlist_id, actions).await
     }
 
     /// Store a sort order on a playlist you own, so every other client on the account shows the
@@ -1048,6 +1137,17 @@ fn strip_vl(id: &str) -> &str {
     id.strip_prefix("VL").unwrap_or(id)
 }
 
+/// `DEDUPE_OPTION_SKIP` skips YouTube's duplicate check: it is what the refusal's own "Add anyway"
+/// button sends (the capture in `duplicate_add_is_rejected`). Sent on an ordinary add, it stores a
+/// second copy instead of refusing.
+fn add_video_action(video_id: &str, allow_duplicates: bool) -> serde_json::Value {
+    let mut action = serde_json::json!({ "action": "ACTION_ADD_VIDEO", "addedVideoId": video_id });
+    if allow_duplicates {
+        action["dedupeOption"] = "DEDUPE_OPTION_SKIP".into();
+    }
+    action
+}
+
 /// `browse/edit_playlist` answers HTTP 200 even when it applies nothing: the refusal is
 /// `"status": "STATUS_FAILED"` in the body. Adding a track the playlist already holds is the
 /// common one, and YouTube marks it by offering an "Add anyway" button whose endpoint repeats the
@@ -1066,6 +1166,22 @@ fn edit_rejection(v: &serde_json::Value) -> Option<Error> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn add_video_action_json() {
+        assert_eq!(
+            add_video_action("dQw4w9WgXcQ", false),
+            json!({ "action": "ACTION_ADD_VIDEO", "addedVideoId": "dQw4w9WgXcQ" })
+        );
+        assert_eq!(
+            add_video_action("dQw4w9WgXcQ", true),
+            json!({
+                "action": "ACTION_ADD_VIDEO",
+                "addedVideoId": "dQw4w9WgXcQ",
+                "dedupeOption": "DEDUPE_OPTION_SKIP"
+            })
+        );
+    }
 
     #[test]
     fn strips_vl_prefix() {

@@ -40,7 +40,6 @@
 //! which Discord dropped — leaving the card stuck as an elapsed counter with no progress bar.
 
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
-use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use discord_rich_presence::{activity, DiscordIpc, DiscordIpcClient};
@@ -171,6 +170,11 @@ impl RpcConfig {
 
 enum Msg {
     Track(Box<Track>),
+    /// The playing track's album, learned after it started. Unlike `Track`, keeps the timeline.
+    Album {
+        video_id: String,
+        album: String,
+    },
     Duration(f64),
     /// A position tick. `at` is when the value was read — the thread ages it before use.
     Position {
@@ -219,6 +223,12 @@ impl DiscordHandle {
             thumbnail: item.thumbnail.as_deref().filter(|_| !local).and_then(discord_thumb),
             local,
         })));
+    }
+
+    /// Same as `LastfmHandle::set_album`: a card played from search has no album until the radio
+    /// behind it arrives (#309), and `set_track` would reset the card's timeline.
+    pub fn set_album(&self, video_id: &str, album: &str) {
+        let _ = self.tx.send(Msg::Album { video_id: video_id.to_owned(), album: album.to_owned() });
     }
 
     /// mpv's reported track length — the only source of a real duration (`SongItem::duration` is a
@@ -399,6 +409,13 @@ impl Presence {
                 self.pos = 0.0;
                 self.pos_at = Instant::now();
                 self.duration = 0.0; // length unknown until mpv reports it (grace waits for it)
+            }
+            // Dirty, since `wants_push` compares the track id and this one hasn't changed.
+            Msg::Album { video_id, album } => {
+                if let Some(t) = self.track.as_mut().filter(|t| t.video_id == video_id) {
+                    t.album = Some(album);
+                    self.cfg_dirty = true;
+                }
             }
             Msg::Duration(secs) => self.duration = secs,
             Msg::Position { pos, at } => {
@@ -809,22 +826,10 @@ fn field(s: &str) -> String {
     out
 }
 
-/// Ready a thumbnail URL for Discord's card: request a decent resolution (stored thumbs are often
-/// row-sized, 60px) and refuse URLs over Discord's length limit. Mirrors `ui/src/lib/thumb.ts` —
-/// only googleusercontent-style URLs carry their size in the URL; i.ytimg path-variant thumbs pass
-/// through unchanged (other sizes can 404).
+/// Ready a thumbnail URL for Discord's card: request a decent resolution (see
+/// [`crate::media::cover_url`]) and refuse URLs over Discord's length limit.
 fn discord_thumb(url: &str) -> Option<String> {
-    static WH: OnceLock<regex::Regex> = OnceLock::new();
-    static S: OnceLock<regex::Regex> = OnceLock::new();
-    let wh = WH.get_or_init(|| regex::Regex::new(r"=w\d+-h\d+").expect("static regex"));
-    let s = S.get_or_init(|| regex::Regex::new(r"=s\d+").expect("static regex"));
-    let sized = if wh.is_match(url) {
-        wh.replace(url, "=w512-h512").into_owned()
-    } else if s.is_match(url) {
-        s.replace(url, "=s512").into_owned()
-    } else {
-        url.to_owned()
-    };
+    let sized = crate::media::cover_url(url);
     (sized.len() <= MAX_ASSET_URL).then_some(sized)
 }
 
@@ -873,6 +878,22 @@ mod tests {
         });
         p.last_send = Some(Instant::now() - Duration::from_secs(60));
         p.cfg_dirty = false;
+    }
+
+    /// An album learned mid-track (#309) re-pushes the shown card, but only for that track: one
+    /// arriving for a track that has since been replaced is dropped.
+    #[test]
+    fn a_late_album_repushes_only_its_own_track() {
+        let mut p = playing("seed", 5.0);
+        p.duration = 200.0;
+        sent_now(&mut p, 5);
+        assert_eq!(p.plan(), Act::Idle);
+        p.apply(Msg::Album { video_id: "other".into(), album: "Nope".into() });
+        assert_eq!(p.track.as_ref().unwrap().album, None);
+        assert_eq!(p.plan(), Act::Idle);
+        p.apply(Msg::Album { video_id: "seed".into(), album: "After Hours".into() });
+        assert_eq!(p.track.as_ref().unwrap().album.as_deref(), Some("After Hours"));
+        assert_eq!(p.plan(), Act::Push);
     }
 
     /// The reported bug: a gapless advance pushed a card before mpv reported the new track's
