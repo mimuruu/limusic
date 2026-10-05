@@ -437,7 +437,13 @@ async fn handle(
             }
 
             // `get_lyrics` is the same call the desktop's own lyrics panel makes, so the phone sees
-            // exactly what the app does — same providers, same cache, same word timings.
+            // exactly what the app does: same providers, same cache, same word timings, and the
+            // romanization pass the desktop applies.
+            //
+            // `source: None` asks for the default provider chain. The desktop's source picker is a
+            // per-song choice made in its own UI; a remote has no picker, and inheriting whatever
+            // was last chosen there would make the phone's lyrics depend on a setting it cannot
+            // see, let alone change.
             let found = crate::lyrics::get_lyrics(
                 &state,
                 crate::lyrics::LyricsRequest {
@@ -447,18 +453,18 @@ async fn handle(
                     album,
                     duration: duration.filter(|d| *d > 0.0),
                 },
+                None,
             )
             .await;
 
-            // `None` is "nobody has lyrics for this", which is an answer, not a failure: the phone
-            // shows that rather than an error banner.
-            Ok((
-                StatusCode::OK,
-                match found {
-                    Some(l) => serde_json::json!({ "lyrics": l }),
-                    None => serde_json::json!({ "lyrics": null }),
-                },
-            ))
+            // A provider miss comes back as `Ok(None)`, which is an answer, not a failure: the phone
+            // says "no lyrics for this" rather than showing an error banner. An `Err` is a real
+            // failure and is reported as one.
+            match found {
+                Ok(Some(l)) => Ok((StatusCode::OK, serde_json::json!({ "lyrics": l }))),
+                Ok(None) => Ok((StatusCode::OK, serde_json::json!({ "lyrics": null }))),
+                Err(e) => Err((StatusCode::BAD_GATEWAY, e)),
+            }
         }
         (Method::GET, "/api/search") => {
             let q = query_param(&query, "q").unwrap_or_default();
