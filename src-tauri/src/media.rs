@@ -20,6 +20,7 @@ use crate::state::AppState;
 /// Update messages: app → media-controls owner thread.
 enum MediaUpdate {
     Metadata { title: String, artist: String, album: Option<String>, cover: Option<String> },
+    Album(String), // learned after the track's metadata went out; keeps the duration
     Duration(f64),
     Playback { playing: bool, pos: f64 },
     Volume(i64), // slider percent, 0-100
@@ -47,12 +48,19 @@ impl MediaHandle {
         });
     }
 
-    pub fn set_duration(&self, secs: f64) {
-        let _ = self.tx.send(MediaUpdate::Duration(secs));
+    /// A search or home card starts playing with no album name; the radio fetched behind it
+    /// carries one (#377, the MPRIS side of #309).
+    pub fn set_album(&self, album: &str) {
+        let _ = self.tx.send(MediaUpdate::Album(album.to_owned()));
     }
 
-    pub fn set_playback(&self, playing: bool, pos: f64) {
-        let _ = self.tx.send(MediaUpdate::Playback { playing, pos });
+    // souvlaki exposes MPRIS Rate as 1.0, so publish listening seconds, like the UI.
+    pub fn set_duration(&self, secs: f64, speed: f64) {
+        let _ = self.tx.send(MediaUpdate::Duration(secs / speed));
+    }
+
+    pub fn set_playback(&self, playing: bool, pos: f64, speed: f64) {
+        let _ = self.tx.send(MediaUpdate::Playback { playing, pos: pos / speed });
     }
 
     pub fn set_volume(&self, volume: i64) {
@@ -127,6 +135,10 @@ fn run(app: AppHandle, rx: std::sync::mpsc::Receiver<MediaUpdate>) {
                 album = al;
                 cover = c;
                 duration = None; // new track — length not known until mpv reports it
+                apply_metadata(&mut controls, &title, &artist, &album, &cover, duration);
+            }
+            MediaUpdate::Album(al) => {
+                album = Some(al);
                 apply_metadata(&mut controls, &title, &artist, &album, &cover, duration);
             }
             MediaUpdate::Duration(secs) => {
@@ -211,7 +223,7 @@ pub(crate) fn handle_event(app: &AppHandle, event: MediaControlEvent) {
             MediaControlEvent::Next => state.next_in_queue().await,
             MediaControlEvent::Previous => state.prev_in_queue().await,
             MediaControlEvent::SetPosition(MediaPosition(pos)) => {
-                let _ = state.player.seek(pos.as_secs_f64());
+                let _ = state.player.seek(pos.as_secs_f64() * state.player.speed());
             }
             MediaControlEvent::SeekBy(dir, by) => {
                 let delta = if matches!(dir, SeekDirection::Forward) {
@@ -219,10 +231,12 @@ pub(crate) fn handle_event(app: &AppHandle, event: MediaControlEvent) {
                 } else {
                     -by.as_secs_f64()
                 };
+                let delta = delta * state.player.speed();
                 let _ = state.player.seek((state.current_position() + delta).max(0.0));
             }
             MediaControlEvent::Seek(dir) => {
                 let delta = if matches!(dir, SeekDirection::Forward) { 10.0 } else { -10.0 };
+                let delta = delta * state.player.speed();
                 let _ = state.player.seek((state.current_position() + delta).max(0.0));
             }
             // An MPRIS widget or KDE Connect (#220). Same path as a volume hotkey, which also
@@ -233,4 +247,31 @@ pub(crate) fn handle_event(app: &AppHandle, event: MediaControlEvent) {
             _ => {}
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_timeline_uses_listening_seconds() {
+        let (tx, rx) = channel();
+        let media = MediaHandle { tx };
+        for (speed, expected_duration, expected_pos) in
+            [(0.5, 480.0, 120.0), (1.0, 240.0, 60.0), (1.25, 192.0, 48.0), (2.0, 120.0, 30.0)]
+        {
+            media.set_duration(240.0, speed);
+            let MediaUpdate::Duration(duration) = rx.recv().unwrap() else { panic!() };
+            assert_eq!(duration, expected_duration);
+            for playing in [true, false] {
+                media.set_playback(playing, 60.0, speed);
+                let MediaUpdate::Playback { playing: sent_playing, pos } = rx.recv().unwrap()
+                else {
+                    panic!()
+                };
+                assert_eq!(sent_playing, playing);
+                assert_eq!(pos, expected_pos);
+            }
+        }
+    }
 }

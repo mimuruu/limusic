@@ -32,9 +32,13 @@ export interface SongItem {
 	thumbnail?: string;
 	/** Item id within a playlist — present only on playlist tracks; needed to remove them. */
 	set_video_id?: string;
-	/** Collaborative playlists only: who added this track, and their avatar. */
+	/** Collaborative playlists only: who added this track, and one avatar per person (several on a
+	 * Taste Match row more than one member shares). */
 	added_by?: string;
-	added_by_avatar?: string;
+	added_by_avatars?: string[];
+	/** When the track went into the playlist (unix seconds). Playlists on this machine only:
+	 *  YouTube sends no such date for its own. */
+	added_at?: number;
 	/** The signed-in user's rating (absent when the response didn't say — same as 'indifferent'). */
 	rating?: Rating;
 	/** "Add to library" off the row's own menu, with a token for each direction. Absent on rows
@@ -57,6 +61,9 @@ export interface SongItem {
 	explicit?: boolean;
 	/** This row links a music video rather than the audio track. */
 	is_video?: boolean;
+	/** The same song's other version (its music video, or back to the audio track), when YouTube
+	 *  paired them. What the player view's Song/Video switch plays (#442). */
+	counterpart?: string;
 	/** One of the user's own YouTube Music uploads. Set by Rust and passed straight back on play:
 	 *  only an authenticated client can stream one, and the row is where that is known. */
 	is_upload?: boolean;
@@ -78,6 +85,8 @@ export interface NowPlaying {
 	/** YouTube's `musicVideoType` says this is a video upload, not the generated audio track.
 	 *  Gates the player view's music-video mode. */
 	isVideo?: boolean;
+	/** A podcast episode: the transport offers speed and 15-second skips (#500). */
+	isEpisode?: boolean;
 }
 
 export type RepeatMode = 'off' | 'all' | 'one';
@@ -157,6 +166,8 @@ export interface BrowseItem {
 
 export interface HomeSection {
 	title: string;
+	/** Which of home's known sections this is (`HOME_KINDS`), in any language. Absent otherwise. */
+	kind?: string;
 	items: BrowseItem[];
 	moreBrowseId?: string;
 	moreParams?: string;
@@ -272,10 +283,18 @@ export interface PlaylistPage {
 	collaborative: boolean;
 	/** Absent on lists YouTube will not reorder: albums, its own radio mixes, On Repeat. */
 	sortMenu?: SortMenu;
+	/** YouTube's own suggestions shelf (`getPlaylistSuggestions`), on playlists you own under 100
+	 *  tracks. The rest get suggestions all the same, from the playlist's radio. */
+	suggestions?: string;
 }
 export interface PlaylistContinuation {
 	items: SongItem[];
 	continuation?: string;
+}
+/** One batch of suggestions; `refresh` swaps it for a fresh one. */
+export interface PlaylistSuggestions {
+	items: SongItem[];
+	refresh?: string;
 }
 
 export interface ArtistCarousel {
@@ -323,7 +342,10 @@ export interface AlbumPage {
 
 export interface ArtistPage {
 	name?: string;
+	/** Wide hero/banner image from the page header. */
 	thumbnail?: string;
+	/** Round channel avatar. Only channels YouTube Music doesn't treat as artists have one. */
+	avatar?: string;
 	description?: string;
 	subscribers?: string;
 	monthlyListeners?: string;
@@ -343,6 +365,8 @@ export const search = (query: string, recordHistory = false) =>
 /** Video uploads only: covers, live sets and remixes with no official release. Empty when the
  *  "hide music videos" setting is on. */
 export const searchVideos = (query: string) => invoke<SongItem[]>('search_videos', { query });
+/** One song or video by id, title and art included (a pasted YouTube link). */
+export const song = (videoId: string) => invoke<SongItem>('song', { videoId });
 /** Unfiltered search → categorized sections. */
 export const searchAll = (query: string, recordHistory = false) =>
 	invoke<SearchResults>('search_all', { query, recordHistory });
@@ -355,6 +379,8 @@ export const searchCards = (query: string, category: 'albums' | 'artists' | 'pla
 	invoke<BrowseItem[]>('search_cards', { query, category });
 export const play = (item: SongItem) => invoke<void>('play', { item });
 export const playIndex = (index: number) => invoke<void>('play_index', { index });
+/** Play the current track's `counterpart` from the same position. Resolves once it plays. */
+export const switchVersion = () => invoke<void>('switch_version');
 /** Remove an upcoming track from the queue (host/local only — guests are add-only). */
 export const removeFromQueue = (index: number) => invoke<void>('remove_from_queue', { index });
 /** Drag-to-reorder: move the upcoming queue item at `from` to index `to` (both past the playing
@@ -387,9 +413,23 @@ export const setRepeat = (mode: RepeatMode) => invoke<void>('set_repeat', { mode
 export const togglePause = () => invoke<void>('toggle_pause');
 export const seek = (position: number) => invoke<void>('seek', { position });
 export const setVolume = (volume: number) => invoke<void>('set_volume', { volume });
-/** Tempo (0.25–2.0) + pitch (−12..=12 semitones). Not persisted: resets on restart. */
-export const setPlaybackParams = (speed: number, semitones: number) =>
-	invoke<void>('set_playback_params', { speed, semitones });
+export interface Reverb {
+	enabled: boolean;
+	preset: number;
+	dry: number;
+	wet: number;
+	decay: number;
+	preDelay: number;
+	damping: number;
+	reflections: number;
+}
+// Lives with the presets, which a Node self-check imports without this module's Tauri imports.
+export { DEFAULT_REVERB } from './effect-presets';
+/** Session-only tempo, pitch, and independent reverb controls. */
+export const setPlaybackParams = (speed: number, semitones: number, reverb: Reverb) =>
+	invoke<void>('set_playback_params', { speed, semitones, reverb });
+export const onPlaybackParams = (cb: (p: { speed: number; semitones: number; reverb: Reverb }) => void) =>
+	listen<{ speed: number; semitones: number; reverb: Reverb }>('playback-params', (e) => cb(e.payload));
 export const getQueue = () => invoke<QueueState>('get_queue');
 /** A `limusicvideo://` URL for the track's music video, or null when there isn't one. `maxHeight`
  *  caps the picture at what the box on screen can actually show. The bytes are proxied through
@@ -420,6 +460,9 @@ export const ambientFrame = (after: number) =>
 
 /** What the event stream already reported, for a webview that started after it did. */
 export interface PlaybackSnapshot {
+	speed: number;
+	semitones: number;
+	reverb: Reverb;
 	now: NowPlaying | null;
 	paused: boolean;
 	position: number;
@@ -506,6 +549,8 @@ export const checkBetaUpdate = () =>
 	);
 /** Open an http(s) link in the real browser, never in the webview itself. */
 export const openExternal = (url: string) => invoke<void>('open_external', { url });
+/** Real quit (not close-to-tray). Same path as the tray's Quit item. */
+export const quitApp = () => invoke<void>('quit_app');
 
 /** Environment + the redacted tail of `limusic.log`, for pasting into a bug report. */
 export const diagnostics = () => invoke<string>('diagnostics');
@@ -547,6 +592,129 @@ export const setMiniCompact = (compact: boolean) => invoke<void>('set_mini_compa
 /** `params` is a `HomeChip.params` token — omit for the unfiltered feed. */
 export const getHome = (params?: string) => invoke<HomePage>('get_home', { params });
 export const getHomeMore = (token: string) => invoke<HomePage>('get_home_more', { token });
+
+/** A comment's author. `channel_id` and `avatar` are absent when YouTube omitted them. */
+export interface CommentAuthor {
+	name: string;
+	channel_id?: string;
+	avatar?: string;
+	verified: boolean;
+	is_creator: boolean;
+	is_artist: boolean;
+}
+
+/** One comment. Counts and the time are YouTube's own display strings ("2.4M", "6 years ago"),
+ *  shown as they come: they are not numbers and not in the app's language. */
+export interface Comment {
+	id: string;
+	text: string;
+	author: CommentAuthor;
+	published?: string;
+	/** The count as it reads for the viewer's current vote. */
+	like_count?: string;
+	/** The count if the viewer has not liked it / has. Swap between these, never add to one. */
+	like_count_notliked?: string;
+	like_count_liked?: string;
+	/** The viewer's vote; absent when read anonymously. */
+	vote?: CommentVote;
+	/** What the viewer can do to this comment now; the vote buttons go by this alone. */
+	actions: CommentAction[];
+	reply_count?: string;
+	hearted: boolean;
+	pinned: boolean;
+	/** The viewer's own comment. */
+	own: boolean;
+	/** What the edit dialog pre-fills, when the response had it plainly; edit `text` otherwise. */
+	edit_text?: string;
+	/** What the viewer can write on it, as the response offered. Empty signed out. */
+	writes: CommentWrite[];
+	/** The reply box's placeholder, if the response sent one. */
+	reply_placeholder?: string;
+}
+
+export type CommentWrite = 'reply' | 'edit' | 'delete';
+
+export type CommentVote = 'neutral' | 'liked' | 'disliked';
+export type CommentAction = 'like' | 'unlike' | 'dislike' | 'undislike';
+
+export interface CommentThread {
+	comment: Comment;
+	/** Loads this thread's replies (`getCommentReplies`); absent when there is nothing to fetch. */
+	replies_token?: string;
+	/** Replies that arrived with the thread, nested levels already flattened. */
+	replies: Comment[];
+}
+
+export interface CommentSort {
+	key: 'top' | 'newest';
+	selected: boolean;
+	/** Pass to `getCommentsMore` to reload the comments in this order. */
+	token: string;
+}
+
+export interface CommentsHeader {
+	/** The short count ("7.8K"). */
+	count_text?: string;
+	sorts: CommentSort[];
+	/** The comment box. Present only when the response carried a way to post (signed in). */
+	composer?: { placeholder?: string };
+}
+
+/** `disabled` covers both "turned off" and "could not be read": either way, nothing to show. */
+export type CommentsState = 'ok' | 'empty' | 'disabled';
+
+export interface CommentsPage {
+	/** First page and sort switches only. */
+	header?: CommentsHeader;
+	threads: CommentThread[];
+	/** Next page of top-level comments; absent is the end of the list. */
+	continuation?: string;
+	state: CommentsState;
+}
+
+export interface CommentReplies {
+	replies: Comment[];
+	continuation?: string;
+}
+
+/** What a comment looks like after YouTube accepted an action on it. */
+export interface CommentActionOutcome {
+	vote: CommentVote;
+	actions: CommentAction[];
+}
+
+/** Why a comments command failed: `CommentsError` in `src-tauri/src/commands.rs`. */
+const COMMENTS_ERROR_KINDS = ['account_changed', 'busy', 'rejected', 'gone', 'uncertain', 'failed'] as const;
+export type CommentsErrorKind = (typeof COMMENTS_ERROR_KINDS)[number];
+
+/** The kind out of whatever a comments command rejected with; anything unrecognised is `failed`. */
+export const commentsErrorKind = (e: unknown): CommentsErrorKind =>
+	typeof e === 'string' && (COMMENTS_ERROR_KINDS as readonly string[]).includes(e)
+		? (e as CommentsErrorKind)
+		: 'failed';
+
+export const getComments = (videoId: string) => invoke<CommentsPage>('get_comments', { videoId });
+/** The next page of comments, or the same comments in another order (a sort token). */
+export const getCommentsMore = (token: string) =>
+	invoke<CommentsPage>('get_comments_more', { token });
+export const getCommentReplies = (token: string) =>
+	invoke<CommentReplies>('get_comment_replies', { token });
+/** Like, unlike, dislike or undislike one comment; only an action in its `actions`. */
+export const commentAction = (commentId: string, action: CommentAction) =>
+	invoke<CommentActionOutcome>('comment_action', { commentId, action });
+/** Post a top-level comment on `videoId`, the track whose comments are shown (needs the header's
+ *  `composer`; refused if it was read for another track). Resolves with the posted comment when
+ *  YouTube's answer carried it, otherwise `null`. */
+export const commentCreate = (videoId: string, text: string) =>
+	invoke<CommentThread | null>('comment_create', { videoId, text });
+/** Reply to a comment that offers `reply`. Resolves with the reply as for `commentCreate`. */
+export const commentReply = (commentId: string, text: string) =>
+	invoke<Comment | null>('comment_reply', { commentId, text });
+/** Replace the text of one of the viewer's own comments (one that offers `edit`). */
+export const commentEdit = (commentId: string, text: string) =>
+	invoke<void>('comment_edit', { commentId, text });
+/** Delete one of the viewer's own comments (one that offers `delete`). */
+export const commentDelete = (commentId: string) => invoke<void>('comment_delete', { commentId });
 /**
  * On Repeat is the app's own playlist (Rust builds it from this machine's play counts), so its
  * title and subtitle are our English rather than YouTube's, and Rust cannot translate them: the
@@ -587,6 +755,8 @@ export const getLocalPlaylists = () =>
 	invoke<BrowseItem[]>('local_playlists').then((items) => items.map(relabelLocal));
 export const getLibraryAlbums = () => invoke<BrowseItem[]>('get_library_albums');
 export const getLibraryArtists = () => invoke<BrowseItem[]>('get_library_artists');
+/** Library ▸ Artists ▸ Subscriptions: the channels the account subscribes to. */
+export const getLibrarySubscriptions = () => invoke<BrowseItem[]>('get_library_subscriptions');
 export const getUploadAlbums = () => invoke<BrowseItem[]>('get_upload_albums');
 /**
  * The account's YouTube Music play history, in YouTube's own day buckets (Today, Yesterday, …).
@@ -613,8 +783,13 @@ export const getPlaylist = (id: string, sort?: ServerSort, desc?: boolean) =>
  */
 export const setPlaylistSort = (playlistId: string, sort: ServerSort) =>
 	invoke<void>('set_playlist_sort', { playlistId, sort });
-export const getPlaylistMore = (token: string) =>
-	invoke<PlaylistContinuation>('get_playlist_more', { token });
+/** With `total` (the playlist's track count) it fetches several pages at once, for a walk that wants
+ *  the whole list. Without it, one page. */
+export const getPlaylistMore = (token: string, total?: number) =>
+	invoke<PlaylistContinuation>('get_playlist_more', { token, total });
+/** `token` is `PlaylistPage.suggestions`, the last batch's `refresh`, or nothing at all. */
+export const getPlaylistSuggestions = (playlistId: string, token?: string) =>
+	invoke<PlaylistSuggestions>('get_playlist_suggestions', { playlistId, token });
 /**
  * videoId → the ids of the playlists you own that hold it. Read straight from local SQLite, so it
  * answers instantly and is empty until `syncPlaylistIndex` has filled it in at least once.
@@ -626,11 +801,64 @@ export const playlistIndex = () => invoke<Record<string, string[]>>('playlist_in
  */
 export const syncPlaylistIndex = () => invoke<Record<string, string[]>>('sync_playlist_index');
 /**
- * videoId → times played, from the local listening history. Same trailing window On Repeat uses
- * (a month): the history table is pruned to it, so there is no older data. A videoId that isn't in
- * the map has not been played inside the window.
+ * videoId → times played, from the local listening history, over the trailing window On Repeat uses
+ * (a month). A videoId that isn't in the map has not been played inside the window.
  */
 export const getPlayCounts = () => invoke<Record<string, number>>('play_counts');
+
+/** The stats page's lists (#396): times played and seconds heard, inside the window. */
+export interface TopSong {
+	song: SongItem;
+	plays: number;
+	secs: number;
+}
+export interface TopArtist {
+	name: string;
+	/** Their channel (`UC…`) or a local artist (`LOCALARTIST:…`); null when the credit links none. */
+	id: string | null;
+	/** The cover of their most-heard song, for when there's no photo. */
+	thumbnail: string | null;
+	plays: number;
+	secs: number;
+}
+export interface TopAlbum {
+	id: string;
+	title: string;
+	artist: string;
+	thumbnail: string | null;
+	plays: number;
+	secs: number;
+}
+/** Everything the stats page shows for one window, counted on this device. */
+export interface ListeningStats {
+	secs: number;
+	/** Seconds in the window of the same length just before this one; null for all time. */
+	prevSecs: number | null;
+	plays: number;
+	songs: number;
+	/** Songs played for the first time ever inside the window. */
+	newSongs: number;
+	artists: number;
+	/** Seconds per local day (`2026-10-17`), oldest first, days with nothing left out. */
+	days: [string, number][];
+	/** Seconds per local weekday (0 = Sunday) and hour: `hours[day * 24 + hour]`. */
+	hours: number[];
+	topSongs: TopSong[];
+	topArtists: TopArtist[];
+	topAlbums: TopAlbum[];
+	/** Unix secs of the oldest play on record; null when nothing has been counted yet. */
+	firstAt: number | null;
+	/** Days in a row with a play, up to today, and the longest run ever. Whole history. */
+	streak: number;
+	bestStreak: number;
+}
+/** `since`: unix secs where the window starts, 0 for all time. It always ends now. */
+export const listeningStats = (since: number) =>
+	invoke<ListeningStats>('listening_stats', { since });
+/** The `limit` most played artists of all time, on the stats page's counts. Home's Familiar Artists. */
+export const topArtists = (limit: number) => invoke<TopArtist[]>('top_artists', { limit });
+/** Forget every counted play. On Repeat empties with it. */
+export const clearListeningHistory = () => invoke<void>('clear_listening_history');
 /**
  * `start`: the clicked track index, or `null` for "just play it" (random opener under shuffle).
  * `sourceId`: the page's playlist/album playlist id — makes autoplay continue with that
@@ -658,6 +886,9 @@ export const startRadio = (kind: 'song' | 'artist' | 'album' | 'playlist', id: s
 	invoke<void>('start_radio', { kind, id, name });
 export const getAlbum = (id: string) => invoke<AlbumPage>('get_album', { id });
 export const getArtist = (id: string) => invoke<ArtistPage>('get_artist', { id });
+/** Other artists' releases this one is featured on (#456). `songsId` is the page's `topSongsId`. */
+export const getArtistAppearsOn = (id: string, songsId: string) =>
+	invoke<BrowseItem[]>('get_artist_appears_on', { id, songsId });
 /** A Moods & Genres tile. `params` browses `MOODS_CATEGORY_ID` into that mood's playlists. */
 export interface Mood {
 	title: string;
@@ -710,6 +941,9 @@ export const removeFromPlaylist = (playlistId: string, videoId: string, setVideo
 /** Bulk removal: one request, all or nothing. `tracks` is [videoId, setVideoId] per row. */
 export const removeManyFromPlaylist = (playlistId: string, tracks: [string, string][]) =>
 	invoke<void>('remove_many_from_playlist', { playlistId, tracks });
+/** Move a playlist row in front of another one (`beforeSetVideoId`), or to the end when null. */
+export const moveInPlaylist = (playlistId: string, setVideoId: string, beforeSetVideoId: string | null) =>
+	invoke<void>('move_in_playlist', { playlistId, setVideoId, beforeSetVideoId });
 /** `local` keeps it on this machine instead of the account, the only kind there is signed out.
  *  Answers the new id: a `LOCALPLAYLIST:` browseId for a local one, YouTube's playlist id else. */
 export const createPlaylist = (title: string, local = false) =>
@@ -999,6 +1233,73 @@ export const lastfmConnect = () => invoke<void>('lastfm_connect');
 export const lastfmDisconnect = () => invoke<void>('lastfm_disconnect');
 export const onLastfmState = (cb: (s: LastfmState) => void): Promise<UnlistenFn> =>
 	listen<LastfmState>('lastfm-state', (e) => cb(e.payload));
+/** `Profile` in lastfm.rs. Counts are 0 when Last.fm left them out. */
+export interface LastfmProfile {
+	image: string | null;
+	url: string | null;
+	scrobbles: number;
+	artists: number;
+	tracks: number;
+	/** Epoch seconds the account was created. */
+	since: number;
+}
+/** `null` when not connected or Last.fm didn't answer. */
+export const lastfmProfile = () => invoke<LastfmProfile | null>('lastfm_profile');
+/** The track fields the scrobbler reads. A `SongItem` is one. */
+export interface ScrobbleTrack {
+	video_id: string;
+	title: string;
+	artists: string;
+	album?: string | null;
+	is_video?: boolean;
+	/** Tells `resolve` which word YouTube joined the artists with in this language (#439). */
+	artist_runs?: ArtistRun[];
+}
+/** `Resolved` in lastfm.rs: what a track scrobbles as, and which settings made it so. */
+export interface ScrobblePreview {
+	artist: string;
+	title: string;
+	album: string;
+	skip: 'edit' | 'incomplete' | null;
+	edit: number | null;
+	split: boolean;
+	rules: number[];
+	errors: [number, string][];
+}
+/** `config` is the Scrobbling tab's state as JSON, saved or not. */
+export const lastfmPreview = (config: string, track: ScrobbleTrack) =>
+	invoke<ScrobblePreview>('lastfm_preview', { config, track });
+
+// --- ListenBrainz scrobbling ----------------------------------------------------------------
+// Same `ScrobbleTrack`/`ScrobblePreview` shapes as Last.fm: both services send what `resolve`
+// in lastfm.rs computes. Only the account calls differ.
+export interface ListenBrainzState {
+	connected: boolean;
+	username?: string | null;
+	error?: string | null;
+}
+export const listenbrainzStatus = () => invoke<ListenBrainzState>('listenbrainz_status');
+/** Validates the pasted user token and stores it. Rejects on a bad token or no network. */
+export const listenbrainzConnect = (token: string) =>
+	invoke<void>('listenbrainz_connect', { token });
+export const listenbrainzDisconnect = () => invoke<void>('listenbrainz_disconnect');
+export const onListenBrainzState = (cb: (s: ListenBrainzState) => void): Promise<UnlistenFn> =>
+	listen<ListenBrainzState>('listenbrainz-state', (e) => cb(e.payload));
+/** Why ListenBrainz refuses listens (`problem` in listenbrainz.rs): `email` until the MetaBrainz
+ *  email is verified, `rejected` for a token it no longer takes. `null` once one goes through. */
+export type ListenBrainzProblem = 'email' | 'rejected';
+export const onListenBrainzProblem = (
+	cb: (p: ListenBrainzProblem | null) => void
+): Promise<UnlistenFn> =>
+	listen<ListenBrainzProblem | null>('listenbrainz-problem', (e) => cb(e.payload));
+/** `Profile` in listenbrainz.rs. */
+export interface ListenBrainzProfile {
+	username: string;
+	url: string;
+	listens: number;
+}
+/** `null` when not connected or ListenBrainz didn't answer. */
+export const listenbrainzProfile = () => invoke<ListenBrainzProfile | null>('listenbrainz_profile');
 
 // --- Listen Together (context/19) -----------------------------------------------------------
 export interface LtUser {
@@ -1062,3 +1363,9 @@ export const onLtState = (cb: (s: LtState) => void): Promise<UnlistenFn> =>
 	listen<LtState>('lt-state', (e) => cb(e.payload));
 export const onLtNotice = (cb: (msg: string) => void): Promise<UnlistenFn> =>
 	listen<string>('lt-notice', (e) => cb(e.payload));
+
+export const getMatugenTheme = () => invoke<string | null>('get_matugen_theme');
+export const onMatugenThemeChanged = (cb: (css: string | null) => void): Promise<UnlistenFn> =>
+	listen<string | null>('matugen-theme-changed', (event) => cb(event.payload));
+export const startMatugenWatcher = () => invoke<void>('start_matugen_watcher');
+export const stopMatugenWatcher = () => invoke<void>('stop_matugen_watcher');

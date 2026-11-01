@@ -5,13 +5,9 @@
 	import { fade, fly } from 'svelte/transition';
 	import { MediaQuery } from 'svelte/reactivity';
 	import { HugeiconsIcon } from '@hugeicons/svelte';
-	import {
-		ArrowDown01Icon,
-		ArrowTurnBackwardIcon,
-		ArrowUp01Icon,
-		InfinityIcon
-	} from '@hugeicons/core-free-icons';
+	import { ArrowTurnBackwardIcon, InfinityIcon } from '@hugeicons/core-free-icons';
 	import TrackRow from '$lib/components/TrackRow.svelte';
+	import NowPlayingPill from '$lib/components/NowPlayingPill.svelte';
 	import { Button } from '$lib/components/ui/button';
 	import { Switch } from '$lib/components/ui/switch';
 	import * as api from '$lib/api';
@@ -28,6 +24,7 @@
 	import { dragScroll, QUEUE_ROW_MIME } from '$lib/dnd';
 	import { playback, prefs, setAutoplay, openAddToPlaylist } from '$lib/player.svelte';
 	import { lt } from '$lib/lt.svelte';
+	import { appearance } from '$lib/theme.svelte';
 	import { currentLocale, t } from '$lib/i18n.svelte';
 
 	const reducedMotion = new MediaQuery('(prefers-reduced-motion: reduce)');
@@ -252,12 +249,19 @@
 	     all of its rows. -->
 	<div role="list" style="padding-top:{w.padTop}px;padding-bottom:{w.padBottom}px">
 		{#each list.slice(w.start, w.end) as { item, key, i } (key)}
-			<!-- data-row: what the scroller measures a row's real height from. -->
+			<!-- data-row: what the scroller measures a row's real height from. `relative!` while
+			     windowed (#380): for each row the window drops, flip's `fix()` sets `position:
+			     absolute` and forces a layout before the padding grows to stand in for it. At the end
+			     of the list that layout is a row short, Chromium clamps scrollTop to it, and the last
+			     row can never be reached. The important beats fix()'s inline style, so the row stays
+			     in flow until it goes, and a windowed list animates nothing anyway. Chromium, 415
+			     rows, wheel to the end: stuck at 22673 of 22729 with the window flipping back 170
+			     times, 22729 and none with this. -->
 			<div
 				data-row
 				data-i={i}
 				role="listitem"
-				class="relative {dragFrom === i ? 'opacity-40' : ''}"
+				class="{windowed ? 'relative!' : 'relative'} {dragFrom === i ? 'opacity-40' : ''}"
 				animate:flip={{ duration: motion.flip, easing: cubicOut }}
 				in:arrive={motion.rows}
 				out:leave={motion.rows}
@@ -367,11 +371,12 @@
 		</div>
 	{/if}
 {/if}
-<!-- The pill floats over the list, so both sit in one positioned box. dragScroll: reordering across
-     a queue taller than the panel needs the edges to pull. -->
+<!-- The pill floats over the list, so both sit in one positioned box. `pb-12` is the pill's height
+     plus its offset, so at the end of the list it covers no row (#380). dragScroll: reordering
+     across a queue taller than the panel needs the edges to pull. -->
 <div class="relative flex min-h-0 flex-1 flex-col">
 	<div
-		class="min-h-0 flex-1 overflow-y-auto px-2 pt-1 pb-2"
+		class="min-h-0 flex-1 overflow-y-auto px-2 pt-1 pb-12"
 		bind:this={el}
 		{@attach sc.attach}
 		{@attach (node) => dragScroll(node, QUEUE_ROW_MIME)}
@@ -399,17 +404,7 @@
 			<p class="p-4 text-sm text-muted-foreground">{t('player.empty_queue')}</p>
 		{/if}
 	</div>
-	<!-- After the scroller in the DOM, so it paints after it: a transition painted before a scroller
-	     can blank its scrollbar on WebKitGTK (docs/UI-PERFORMANCE.md). Opacity only. -->
-	{#if away}
-		<button
-			class="absolute bottom-3 left-1/2 z-10 flex -translate-x-1/2 cursor-pointer items-center gap-1.5 rounded-full border bg-popover px-3 py-1.5 text-xs font-medium text-popover-foreground shadow-lg hover:bg-accent"
-			onclick={() => toPlaying(true)}
-			transition:fade={{ duration: reducedMotion.current ? 0 : 150 }}
-		>
-			<!-- altIcon/showAlt: `icon` is frozen at mount. -->
-			<HugeiconsIcon icon={ArrowDown01Icon} altIcon={ArrowUp01Icon} showAlt={awayAbove} class="size-3.5" />
-			{t('player.now_playing')}
-		</button>
+	{#if away && appearance.nowPlayingPill}
+		<NowPlayingPill above={awayAbove} onclick={() => toPlaying(true)} />
 	{/if}
 </div>

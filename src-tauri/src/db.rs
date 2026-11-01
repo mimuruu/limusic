@@ -77,6 +77,9 @@ pub struct CachedStream {
     /// without it a replay inside the cache window can't tell the player view whether the track
     /// has a music video. `None` on rows written before the column existed.
     pub is_video: Option<bool>,
+    /// The same verdict read as "a podcast episode" (#500), so a replay keeps the podcast controls.
+    /// `None` on rows written before the column, and the queue row's own flag stands.
+    pub is_episode: Option<bool>,
     /// The watch-history ping (`videostatsPlaybackUrl` + the client that was issued it), cached for
     /// the same reason again: a hit skips `/player`, and without it every replay inside the cache
     /// window went unregistered. That included plenty of *first* listens, because the gapless
@@ -151,7 +154,7 @@ impl Db {
     }
 
     pub fn open(path: &std::path::Path) -> rusqlite::Result<Self> {
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         // This file is a cache plus a little UI state, and it is written on every volume nudge,
         // pause, track change and queue edit. WAL keeps those off a full rollback journal, and
         // `synchronous=NORMAL` drops the fsync per commit: a power cut can lose the last few
@@ -181,13 +184,22 @@ impl Db {
                 lyrics     TEXT,
                 fetched_at INTEGER NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS plays (
+            -- Listening history (#396): one row per play, kept for good. Like `local_playlists`
+            -- this is the user's own data, not a cache. `secs` is how long the song was actually
+            -- heard (pauses and seeks don't count), and it keeps growing while the song plays on
+            -- (see `AppState::hear`). The song itself lives once in `listen_songs`, as the latest
+            -- `SongItem` it was played as. Stats and On Repeat are both built from these two.
+            CREATE TABLE IF NOT EXISTS listens (
                 id        INTEGER PRIMARY KEY,
                 video_id  TEXT NOT NULL,
                 played_at INTEGER NOT NULL,
+                secs      INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS listens_played_at ON listens(played_at);
+            CREATE TABLE IF NOT EXISTS listen_songs (
+                video_id  TEXT PRIMARY KEY,
                 song_json TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS plays_played_at ON plays(played_at);
             CREATE TABLE IF NOT EXISTS local_tracks (
                 path          TEXT PRIMARY KEY,
                 title         TEXT NOT NULL,
@@ -263,6 +275,9 @@ impl Db {
         // Same for the AlbumArtist tag, which older scans read but never stored. The SCAN_VERSION
         // bump in local.rs is what refills it; this only makes the column exist.
         let _ = conn.execute("ALTER TABLE local_tracks ADD COLUMN album_artist TEXT", []);
+        // Older rows get pos = id so their relative order remains unchanged after adding position ordering.
+        let _ = conn.execute("ALTER TABLE local_playlist_tracks ADD COLUMN pos INTEGER", []);
+        let _ = conn.execute("UPDATE local_playlist_tracks SET pos = id WHERE pos IS NULL", []);
         // And the disc number (issue #315), refilled the same way.
         let _ = conn
             .execute("ALTER TABLE local_tracks ADD COLUMN disc_no INTEGER NOT NULL DEFAULT 0", []);
@@ -282,9 +297,8 @@ impl Db {
         if conn.execute("ALTER TABLE stream_url_cache ADD COLUMN client TEXT", []).is_ok() {
             let _ = conn.execute("DELETE FROM stream_url_cache", []);
         }
-        // Local files are no longer recorded as plays (see `AppState::on_position`), but 0.3.1
-        // recorded them for a while, so clear out anything already sitting in On Repeat's table.
-        let _ = conn.execute("DELETE FROM plays WHERE video_id LIKE 'LOCAL:%'", []);
+        // Podcast episode (#500). No wipe: a NULL defers to the queue row, which episode pages flag.
+        let _ = conn.execute("ALTER TABLE stream_url_cache ADD COLUMN is_episode INTEGER", []);
         // Sweep dead stream URLs here as well as on write. `put_stream` only runs on a cache miss,
         // so a session spent replaying cached tracks never triggers one, and the backlog that
         // built up before anything pruned at all (1803 rows, 1772 of them expired, on a real
@@ -314,6 +328,15 @@ impl Db {
             let _ = conn.execute("DELETE FROM settings WHERE key = 'lyrics_boidu'", []);
             let _ = conn.execute("DELETE FROM lyrics_cache", []);
             let _ = conn.execute_batch("PRAGMA user_version = 2");
+        }
+        // #396: On Repeat's `plays` (a trailing month, a full `SongItem` per row) becomes
+        // `listens` + `listen_songs`, kept for good. Its rows carry over so the stats page opens on
+        // up to a month of history instead of nothing. Checked on every open rather than once per
+        // `user_version`: an older release run against the same file (a downgrade, or `cargo tauri
+        // dev` beside the installed app) recreates `plays` and fills it, and those plays belong in
+        // the history too. One transaction, so a crash halfway retries next launch.
+        if let Err(e) = migrate_plays(&mut conn) {
+            tracing::warn!(error = %e, "moving plays into listens failed, will retry");
         }
         // One-time migration of the pre-multi-account single session into `accounts`. The legacy
         // settings rows stay in place as projections of the active account (see `StoredAccount`).
@@ -666,7 +689,7 @@ impl Db {
     pub fn get_stream(&self, video_id: &str, now: i64) -> Option<CachedStream> {
         let conn = self.0.lock().unwrap();
         conn.query_row(
-            "SELECT url, itag, expires_at, loudness_db, is_video, ping_url, ping_client, client FROM stream_url_cache WHERE video_id = ?1 AND expires_at > ?2",
+            "SELECT url, itag, expires_at, loudness_db, is_video, ping_url, ping_client, client, is_episode FROM stream_url_cache WHERE video_id = ?1 AND expires_at > ?2",
             rusqlite::params![video_id, now],
             |r| {
                 Ok(CachedStream {
@@ -678,6 +701,7 @@ impl Db {
                     ping_url: r.get(5)?,
                     ping_client: r.get(6)?,
                     client: r.get(7)?,
+                    is_episode: r.get(8)?,
                 })
             },
         )
@@ -699,8 +723,8 @@ impl Db {
     pub fn put_stream(&self, video_id: &str, row: &CachedStream, now: i64) {
         let conn = self.0.lock().unwrap();
         let _ = conn.execute(
-            "INSERT INTO stream_url_cache(video_id, url, itag, expires_at, loudness_db, is_video, ping_url, ping_client, client) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-             ON CONFLICT(video_id) DO UPDATE SET url = excluded.url, itag = excluded.itag, expires_at = excluded.expires_at, loudness_db = excluded.loudness_db, is_video = excluded.is_video, ping_url = excluded.ping_url, ping_client = excluded.ping_client, client = excluded.client",
+            "INSERT INTO stream_url_cache(video_id, url, itag, expires_at, loudness_db, is_video, ping_url, ping_client, client, is_episode) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(video_id) DO UPDATE SET url = excluded.url, itag = excluded.itag, expires_at = excluded.expires_at, loudness_db = excluded.loudness_db, is_video = excluded.is_video, ping_url = excluded.ping_url, ping_client = excluded.ping_client, client = excluded.client, is_episode = excluded.is_episode",
             rusqlite::params![
                 video_id,
                 row.url,
@@ -710,7 +734,8 @@ impl Db {
                 row.is_video,
                 row.ping_url,
                 row.ping_client,
-                row.client
+                row.client,
+                row.is_episode
             ],
         );
         let _ = conn.execute("DELETE FROM stream_url_cache WHERE expires_at <= ?1", [now]);
@@ -809,31 +834,55 @@ impl Db {
         );
     }
 
-    // --- play history (the On Repeat playlist) ------------------------------------------------
+    // --- listening history (the stats page, #396, and the On Repeat playlist) -----------------
 
-    /// Record one completed play and drop everything that has fallen out of the window, so the
-    /// table stays bounded at roughly a month of listening whether or not anyone opens the
-    /// playlist. `song_json` is the serialized `SongItem`, kept per row so the playlist can be
-    /// rebuilt without asking YouTube for metadata it already gave us.
-    pub fn record_play(&self, video_id: &str, song_json: &str, now: i64, window: i64) {
+    /// Count a play: the song's latest metadata into `listen_songs` and a `listens` row holding the
+    /// `secs` heard so far. Returns the row, which [`Db::set_listen_secs`] keeps up to date while
+    /// the song plays on. `song_json` is the serialized `SongItem`, so the stats and On Repeat are
+    /// built without asking YouTube for metadata it already gave us.
+    pub fn record_listen(
+        &self,
+        video_id: &str,
+        song_json: &str,
+        now: i64,
+        secs: i64,
+    ) -> Option<i64> {
         let conn = self.0.lock().unwrap();
         let _ = conn.execute(
-            "INSERT INTO plays(video_id, played_at, song_json) VALUES(?1, ?2, ?3)",
-            rusqlite::params![video_id, now, song_json],
+            "INSERT INTO listen_songs(video_id, song_json) VALUES(?1, ?2)
+             ON CONFLICT(video_id) DO UPDATE SET song_json = excluded.song_json",
+            [video_id, song_json],
         );
-        let _ = conn.execute("DELETE FROM plays WHERE played_at < ?1", [now - window]);
+        conn.execute(
+            "INSERT INTO listens(video_id, played_at, secs) VALUES(?1, ?2, ?3)",
+            rusqlite::params![video_id, now, secs],
+        )
+        .ok()
+        .map(|_| conn.last_insert_rowid())
+    }
+
+    pub fn set_listen_secs(&self, id: i64, secs: i64) {
+        let conn = self.0.lock().unwrap();
+        let _ = conn.execute("UPDATE listens SET secs = ?2 WHERE id = ?1", [id, secs]);
+    }
+
+    /// "Clear listening history" on the stats page. On Repeat empties with it: same rows.
+    pub fn clear_listens(&self) {
+        let conn = self.0.lock().unwrap();
+        let _ = conn.execute_batch("DELETE FROM listens; DELETE FROM listen_songs;");
     }
 
     /// The most-played songs since `since`, as `(song_json, play_count)` ranked by plays and then
-    /// by recency. Each row's JSON comes from that song's latest play: SQLite resolves a bare
-    /// column against the row matching the single `max()` in the query.
+    /// by recency. Local files are left out: this is On Repeat, a YouTube Music playlist, and a row
+    /// pointing at a path on this disk doesn't belong in it.
     pub fn top_plays(&self, since: i64, limit: usize) -> Vec<(String, i64)> {
         let conn = self.0.lock().unwrap();
         let mut out = Vec::new();
         if let Ok(mut stmt) = conn.prepare(
-            "SELECT song_json, COUNT(*) AS plays, MAX(played_at) AS last FROM plays
-             WHERE played_at >= ?1
-             GROUP BY video_id
+            "SELECT s.song_json, COUNT(*) AS plays, MAX(l.played_at) AS last
+             FROM listens l JOIN listen_songs s ON s.video_id = l.video_id
+             WHERE l.played_at >= ?1 AND l.video_id NOT LIKE 'LOCAL:%'
+             GROUP BY l.video_id
              ORDER BY plays DESC, last DESC
              LIMIT ?2",
         ) {
@@ -848,18 +897,88 @@ impl Db {
 
     /// Play count per videoId since `since`. [`Db::top_plays`] answers "what are my 20 most played
     /// songs"; this answers "how many times have I played each of these", which is what sorting an
-    /// arbitrary playlist by plays needs. Same table, so the same trailing window applies.
+    /// arbitrary playlist by plays needs.
     pub fn play_counts(&self, since: i64) -> Vec<(String, i64)> {
         let conn = self.0.lock().unwrap();
         let mut out = Vec::new();
-        if let Ok(mut stmt) = conn
-            .prepare("SELECT video_id, COUNT(*) FROM plays WHERE played_at >= ?1 GROUP BY video_id")
-        {
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT video_id, COUNT(*) FROM listens WHERE played_at >= ?1 GROUP BY video_id",
+        ) {
             if let Ok(rows) = stmt.query_map([since], |r| Ok((r.get(0)?, r.get(1)?))) {
                 out.extend(rows.flatten());
             }
         }
         out
+    }
+
+    /// When each song heard since `since` was last heard. Radio pages put these behind the songs
+    /// you haven't heard (`AppState::freshen_radio`).
+    pub fn last_played(&self, since: i64) -> Vec<(String, i64)> {
+        all(
+            &self.0.lock().unwrap(),
+            "SELECT video_id, MAX(played_at) FROM listens WHERE played_at >= ?1 GROUP BY video_id",
+            [since],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+    }
+
+    /// Everything the stats page draws for `[since, now)`, in one lock. Grouping by the local
+    /// calendar (`'localtime'`) is SQLite's, which reads the same zone the webview does.
+    pub fn listening(&self, since: i64, now: i64) -> Listening {
+        let conn = self.0.lock().unwrap();
+        let sum = |sql: &str, a: i64, b: i64| -> i64 {
+            conn.query_row(sql, [a, b], |r| r.get::<_, Option<i64>>(0)).ok().flatten().unwrap_or(0)
+        };
+        Listening {
+            since,
+            songs: songs(&conn, since, now),
+            days: all(
+                &conn,
+                "SELECT date(played_at, 'unixepoch', 'localtime') AS d, SUM(secs)
+                 FROM listens WHERE played_at >= ?1 AND played_at < ?2 GROUP BY d ORDER BY d",
+                [since, now],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            ),
+            hours: all(
+                &conn,
+                "SELECT CAST(strftime('%w', played_at, 'unixepoch', 'localtime') AS INTEGER) AS w,
+                        CAST(strftime('%H', played_at, 'unixepoch', 'localtime') AS INTEGER) AS h,
+                        SUM(secs)
+                 FROM listens WHERE played_at >= ?1 AND played_at < ?2 GROUP BY w, h",
+                [since, now],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            ),
+            prev_secs: sum(
+                "SELECT SUM(secs) FROM listens WHERE played_at >= ?1 AND played_at < ?2",
+                since - (now - since),
+                since,
+            ),
+            first_at: conn
+                .query_row("SELECT MIN(played_at) FROM listens", [], |r| r.get(0))
+                .ok()
+                .flatten(),
+            // A day's number counts local midnights: julianday turns at noon, hence the +0.5.
+            day_numbers: all(
+                &conn,
+                "SELECT DISTINCT CAST(julianday(played_at, 'unixepoch', 'localtime') + 0.5 AS INTEGER)
+                 AS n FROM listens ORDER BY n",
+                [],
+                |r| r.get(0),
+            ),
+            today: conn
+                .query_row(
+                    "SELECT CAST(julianday(?1, 'unixepoch', 'localtime') + 0.5 AS INTEGER)",
+                    [now],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0),
+        }
+    }
+
+    /// Per song played in `[since, now)`: what [`Listening::songs`] holds, without the rest of the
+    /// stats page. Home's Familiar Artists (#497).
+    pub fn listened_songs(&self, since: i64, now: i64) -> Vec<(String, i64, i64, i64)> {
+        songs(&self.0.lock().unwrap(), since, now)
     }
 
     // --- playlist membership index (which of your playlists hold a track) ----------------------
@@ -981,7 +1100,7 @@ impl Db {
             "SELECT p.id, p.title, p.description,
                     (SELECT COUNT(*) FROM local_playlist_tracks t WHERE t.playlist_id = p.id),
                     (SELECT song_json FROM local_playlist_tracks t WHERE t.playlist_id = p.id
-                     ORDER BY t.id LIMIT 1)
+                     ORDER BY t.pos, t.id LIMIT 1)
              FROM local_playlists p {}
              ORDER BY p.updated_at DESC, p.id DESC",
             if id.is_some() { "WHERE p.id = ?1" } else { "" }
@@ -1008,14 +1127,15 @@ impl Db {
         out
     }
 
-    /// One playlist's tracks in the order they were added, as `(row id, song_json)`.
-    pub fn local_playlist_tracks(&self, id: i64) -> Vec<(i64, String)> {
+    /// One playlist's tracks in the order they were added, as `(row id, song_json, added_at)`.
+    pub fn local_playlist_tracks(&self, id: i64) -> Vec<(i64, String, i64)> {
         let conn = self.0.lock().unwrap();
         let mut out = Vec::new();
         if let Ok(mut stmt) = conn.prepare(
-            "SELECT id, song_json FROM local_playlist_tracks WHERE playlist_id = ?1 ORDER BY id",
+            "SELECT id, song_json, added_at FROM local_playlist_tracks WHERE playlist_id = ?1 \
+             ORDER BY pos, id",
         ) {
-            if let Ok(rows) = stmt.query_map([id], |r| Ok((r.get(0)?, r.get(1)?))) {
+            if let Ok(rows) = stmt.query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))) {
                 out.extend(rows.flatten());
             }
         }
@@ -1044,7 +1164,8 @@ impl Db {
         for (video_id, json) in songs {
             let n = tx.execute(
                 "INSERT OR IGNORE INTO local_playlist_tracks(playlist_id, video_id, song_json, \
-                 added_at) VALUES(?1, ?2, ?3, ?4)",
+                 added_at, pos) VALUES(?1, ?2, ?3, ?4, \
+                 (SELECT COALESCE(MAX(pos), 0) + 1 FROM local_playlist_tracks WHERE playlist_id = ?1))",
                 rusqlite::params![id, video_id, json, now],
             )?;
             added.push(n > 0);
@@ -1054,6 +1175,60 @@ impl Db {
         }
         tx.commit()?;
         Ok(added)
+    }
+
+    /// Reorder a track within the playlist by moving `row` before `before` (or at the end if `None`),
+    /// rewriting all positions sequentially and updating the playlist's `updated_at` timestamp.
+    pub fn move_local_playlist_track(
+        &self,
+        id: i64,
+        row: i64,
+        before: Option<i64>,
+        now: i64,
+    ) -> rusqlite::Result<()> {
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut ids = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM local_playlist_tracks WHERE playlist_id = ?1 ORDER BY pos, id",
+            )?;
+            let rows = stmt.query_map([id], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<i64>>>()?
+        };
+
+        let idx = match ids.iter().position(|&x| x == row) {
+            Some(i) => i,
+            None => return Err(rusqlite::Error::QueryReturnedNoRows),
+        };
+        ids.remove(idx);
+
+        match before {
+            Some(b) => {
+                let target_idx = match ids.iter().position(|&x| x == b) {
+                    Some(i) => i,
+                    None => return Err(rusqlite::Error::QueryReturnedNoRows),
+                };
+                ids.insert(target_idx, row);
+            }
+            None => {
+                ids.push(row);
+            }
+        }
+
+        for (pos, track_id) in ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE local_playlist_tracks SET pos = ?1 WHERE id = ?2",
+                rusqlite::params![pos as i64, track_id],
+            )?;
+        }
+
+        tx.execute(
+            "UPDATE local_playlists SET updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![now, id],
+        )?;
+
+        tx.commit()?;
+        Ok(())
     }
 
     /// Drop rows by their row id. Scoped to the playlist, so a stale id from another list can
@@ -1219,6 +1394,92 @@ impl Db {
     }
 }
 
+/// See [`Listening::songs`].
+fn songs(conn: &Connection, since: i64, now: i64) -> Vec<(String, i64, i64, i64)> {
+    all(
+        conn,
+        "WITH firsts AS (SELECT video_id, MIN(played_at) AS first FROM listens GROUP BY video_id)
+         SELECT s.song_json, COUNT(*), SUM(l.secs), f.first
+         FROM listens l
+         JOIN listen_songs s ON s.video_id = l.video_id
+         JOIN firsts f ON f.video_id = l.video_id
+         WHERE l.played_at >= ?1 AND l.played_at < ?2
+         GROUP BY l.video_id",
+        [since, now],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )
+}
+
+/// Every row of a query, mapped; empty when it fails. The stats read best-effort, like the rest.
+fn all<T>(
+    conn: &Connection,
+    sql: &str,
+    args: impl rusqlite::Params,
+    map: impl FnMut(&rusqlite::Row) -> rusqlite::Result<T>,
+) -> Vec<T> {
+    let Ok(mut stmt) = conn.prepare(sql) else { return Vec::new() };
+    let out = stmt.query_map(args, map).map(|rows| rows.flatten().collect()).unwrap_or_default();
+    out
+}
+
+/// #396: fold On Repeat's old `plays` table into `listens` + `listen_songs` and drop it. Nothing to
+/// do once it's gone, which is every launch but the first (see the call in `open`).
+fn migrate_plays(conn: &mut Connection) -> rusqlite::Result<()> {
+    let had: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'plays')",
+        [],
+        |r| r.get(0),
+    )?;
+    if had {
+        let tx = conn.transaction()?;
+        let rows: Vec<(String, i64, String)> = {
+            let mut stmt =
+                tx.prepare("SELECT video_id, played_at, song_json FROM plays ORDER BY played_at")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        for (video_id, played_at, json) in rows {
+            let duration = serde_json::from_str::<serde_json::Value>(&json)
+                .ok()
+                .and_then(|v| v.get("duration")?.as_str().map(str::to_owned));
+            let secs = crate::state::parse_duration_ms(duration.as_deref()) / 1000;
+            // Oldest first, so each song is left carrying its latest metadata.
+            tx.execute(
+                "INSERT INTO listen_songs(video_id, song_json) VALUES(?1, ?2)
+                 ON CONFLICT(video_id) DO UPDATE SET song_json = excluded.song_json",
+                [&video_id, &json],
+            )?;
+            tx.execute(
+                "INSERT INTO listens(video_id, played_at, secs) VALUES(?1, ?2, ?3)",
+                rusqlite::params![video_id, played_at, secs],
+            )?;
+        }
+        tx.execute_batch("DROP TABLE plays")?;
+        tx.commit()?;
+    }
+    Ok(())
+}
+
+/// The raw material of the stats page, as [`Db::listening`] reads it. `stats.rs` shapes it.
+#[derive(Debug, Default)]
+pub struct Listening {
+    /// Where the window starts: a song first played at or after it is new.
+    pub since: i64,
+    /// Per song played in the window: `(song_json, plays, secs, first play ever)`.
+    pub songs: Vec<(String, i64, i64, i64)>,
+    /// Seconds per local day (`2026-10-17`), oldest first, days with nothing left out.
+    pub days: Vec<(String, i64)>,
+    /// `(weekday, hour, secs)`, local, weekday 0 = Sunday. Hours with nothing left out.
+    pub hours: Vec<(i64, i64, i64)>,
+    /// Seconds heard in the window of the same length just before this one.
+    pub prev_secs: i64,
+    /// The oldest play on record, `None` with nothing recorded.
+    pub first_at: Option<i64>,
+    /// Every local day with a play, as day numbers, ascending; and today's.
+    pub day_numbers: Vec<i64>,
+    pub today: i64,
+}
+
 const LOCAL_TRACK_UPSERT: &str =
     "INSERT INTO local_tracks(path, title, artist, album, album_key, album_artist, track_no, duration_secs, cover, mtime, disc_no)
      VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
@@ -1281,9 +1542,7 @@ mod tests {
             ("b", "{\"b\":3}", 1_060),
             ("c", "{\"c\":1}", 2_000),
         ] {
-            // A window wide enough that inserting doesn't prune what the next row needs; the
-            // "old" row is excluded by `since` below instead.
-            d.record_play(id, json, at, 10_000);
+            d.record_listen(id, json, at, 0);
         }
 
         let top = d.top_plays(900, 20);
@@ -1306,6 +1565,10 @@ mod tests {
             d.play_counts(1_500) == vec![("c".into(), 1)],
             "`since` cuts the same way it does for top_plays"
         );
+
+        let mut last = d.last_played(900);
+        last.sort();
+        assert_eq!(last, vec![("a".into(), 1_100), ("b".into(), 1_060), ("c".into(), 2_000)]);
     }
 
     #[test]
@@ -1396,28 +1659,55 @@ mod tests {
     }
 
     #[test]
-    fn opening_the_db_clears_local_files_out_of_on_repeat() {
-        // 0.3.1 counted local plays before On Repeat excluded them; opening the db drops the rows.
+    fn local_playlist_track_reordering() {
+        let d = db();
+        let song = |v: &str| (v.to_string(), format!(r#"{{"video_id":"{v}"}}"#));
+        let a = d.create_local_playlist("Mix", 10).unwrap();
+        d.add_local_playlist_tracks(a, &[song("t1"), song("t2"), song("t3")], 20).unwrap();
+
+        let rows = d.local_playlist_tracks(a);
+        assert_eq!(rows.len(), 3);
+        let id1 = rows[0].0;
+        let _id2 = rows[1].0;
+        let id3 = rows[2].0;
+        assert_eq!(
+            rows.iter().map(|r| r.1.clone()).collect::<Vec<_>>(),
+            vec![song("t1").1, song("t2").1, song("t3").1]
+        );
+
+        // Move the last one to the front.
+        d.move_local_playlist_track(a, id3, Some(id1), 21).unwrap();
+        let rows = d.local_playlist_tracks(a);
+        assert_eq!(
+            rows.iter().map(|r| r.1.clone()).collect::<Vec<_>>(),
+            vec![song("t3").1, song("t1").1, song("t2").1]
+        );
+        assert!(d.local_playlists()[0].first_song.as_deref().unwrap().contains("t3"));
+
+        // Move the first one to the end.
+        d.move_local_playlist_track(a, id3, None, 22).unwrap();
+        let rows = d.local_playlist_tracks(a);
+        assert_eq!(
+            rows.iter().map(|r| r.1.clone()).collect::<Vec<_>>(),
+            vec![song("t1").1, song("t2").1, song("t3").1]
+        );
+    }
+
+    #[test]
+    fn on_repeat_leaves_local_files_out_and_the_file_is_wal() {
         let path = std::env::temp_dir().join("limusic-plays-purge-test.sqlite");
         std::fs::remove_file(&path).ok();
-        {
-            let d = Db::open(&path).unwrap();
-            // Piggybacking on the one file-backed test: `journal_mode` answers with a row, so
-            // setting it via `pragma_update` would silently do nothing (and `:memory:` cannot be
-            // WAL at all, which is why this can't live in its own in-memory test).
-            let mode: String =
-                d.0.lock().unwrap().query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
-            assert_eq!(mode, "wal");
-            d.record_play("LOCAL:/music/a.mp3", "{\"local\":1}", 1_000, 10_000);
-            d.record_play("dQw4w9WgXcQ", "{\"yt\":1}", 1_000, 10_000);
-            assert_eq!(d.top_plays(0, 20).len(), 2, "both were recorded");
-        }
         let d = Db::open(&path).unwrap();
-        assert_eq!(
-            d.top_plays(0, 20),
-            vec![("{\"yt\":1}".to_string(), 1)],
-            "only the YouTube play survives"
-        );
+        // Piggybacking on a file-backed test: `journal_mode` answers with a row, so setting it via
+        // `pragma_update` would silently do nothing (and `:memory:` cannot be WAL at all, which is
+        // why this can't live in its own in-memory test).
+        let mode: String =
+            d.0.lock().unwrap().query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+        assert_eq!(mode, "wal");
+        d.record_listen("LOCAL:/music/a.mp3", "{\"local\":1}", 1_000, 0);
+        d.record_listen("dQw4w9WgXcQ", "{\"yt\":1}", 1_000, 0);
+        assert_eq!(d.top_plays(0, 20), vec![("{\"yt\":1}".to_string(), 1)]);
+        assert_eq!(d.play_counts(0).len(), 2, "both count toward a playlist's sort");
         drop(d);
         std::fs::remove_file(&path).ok();
     }
@@ -1464,6 +1754,7 @@ mod tests {
             expires_at,
             loudness_db: None,
             is_video: None,
+            is_episode: None,
             ping_url: None,
             ping_client: None,
             client: None,
@@ -1545,12 +1836,80 @@ mod tests {
         assert_eq!(d.get_stream("v", 900).unwrap().client.as_deref(), Some("VISIONOS"));
     }
 
+    /// A play's row grows with the time heard, and clearing the history takes the songs too.
     #[test]
-    fn record_play_prunes_outside_the_window() {
+    fn a_listen_grows_and_clears() {
         let d = db();
-        d.record_play("stale", "{}", 1_000, 60);
-        d.record_play("fresh", "{}", 5_000, 60); // prunes anything before 4_940
-        assert_eq!(d.top_plays(0, 20), vec![("{}".to_string(), 1)]);
+        let row = d.record_listen("a", "{\"a\":1}", 1_000, 30).unwrap();
+        d.set_listen_secs(row, 200);
+        let l = d.listening(0, 2_000);
+        assert_eq!(l.songs, vec![("{\"a\":1}".to_string(), 1, 200, 1_000)]);
+        assert_eq!(l.first_at, Some(1_000));
+        d.clear_listens();
+        let l = d.listening(0, 2_000);
+        assert!(l.songs.is_empty() && l.first_at.is_none() && l.day_numbers.is_empty());
+    }
+
+    /// The window, the one before it, first plays and the local-day buckets, against a fixed clock.
+    #[test]
+    fn listening_splits_the_window_from_the_one_before() {
+        let d = db();
+        let day = 86_400;
+        let t0 = 1_760_000_000; // any instant; the buckets are local days around it
+        d.record_listen("old", "{}", t0 - 2 * day + 5, 100); // the previous window only
+        d.record_listen("a", "{}", t0 - day, 60); // also in the previous window, at its edge
+        d.record_listen("a", "{}", t0 + 10, 40);
+        d.record_listen("b", "{}", t0 + day, 50);
+        let l = d.listening(t0, t0 + 2 * day);
+        assert_eq!(l.songs.len(), 2);
+        assert_eq!(l.prev_secs, 160, "the two days before `since`");
+        let firsts: Vec<i64> = l.songs.iter().map(|s| s.3).collect();
+        assert!(firsts.contains(&(t0 - day)), "\"a\" carries its first play, before the window");
+        assert_eq!(l.days.iter().map(|(_, s)| s).sum::<i64>(), 90);
+        assert_eq!(l.hours.iter().map(|(_, _, s)| s).sum::<i64>(), 90);
+        assert_eq!(l.day_numbers.len(), 4, "the whole history, not the window");
+        assert_eq!(l.today, *l.day_numbers.last().unwrap() + 1);
+    }
+
+    /// On Repeat's old `plays` table moves into `listens`, length standing in for time heard.
+    #[test]
+    fn opening_the_db_moves_plays_into_listens() {
+        let dir = qtest_dir("plays-to-listens");
+        let path = dir.join("limusic.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V0_8_1).unwrap();
+            for (id, at, json) in [
+                ("a", 100, r#"{"video_id":"a","title":"A","artists":"X","duration":"3:05"}"#),
+                ("a", 200, r#"{"video_id":"a","title":"A2","artists":"X","duration":"3:05"}"#),
+                ("b", 150, r#"{"video_id":"b","title":"B","artists":"Y"}"#),
+            ] {
+                conn.execute(
+                    "INSERT INTO plays(video_id, played_at, song_json) VALUES(?1, ?2, ?3)",
+                    rusqlite::params![id, at, json],
+                )
+                .unwrap();
+            }
+        }
+        let d = Db::open(&path).unwrap();
+        let mut songs = d.listening(0, 1_000).songs;
+        songs.sort_by_key(|s| s.2);
+        assert_eq!(songs.len(), 2);
+        assert_eq!((songs[0].1, songs[0].2), (1, 0), "no length, no time");
+        assert_eq!((songs[1].1, songs[1].2), (2, 370), "3:05 twice");
+        assert!(songs[1].0.contains("A2"), "the latest metadata wins");
+        let gone: bool = d
+            .0
+            .lock()
+            .unwrap()
+            .query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'plays')", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(!gone, "the old table is dropped");
+        drop(d);
+        assert_eq!(Db::open(&path).unwrap().listening(0, 1_000).songs.len(), 2, "runs once");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The key follows the Google account, not the jar: the `__Secure-3PAPISID` alias resolves to
@@ -2070,6 +2429,7 @@ mod tests {
             expires_at: later,
             loudness_db: Some(-2.0),
             is_video: Some(true),
+            is_episode: Some(true),
             ping_url: Some("https://s.youtube.com/api/stats/playback".into()),
             ping_client: Some("WEB_REMIX".into()),
             client: Some("VISIONOS".into()),
@@ -2084,13 +2444,14 @@ mod tests {
             "{tag}"
         );
         assert_eq!(got.ping_client.as_deref(), Some("WEB_REMIX"), "{tag}");
+        assert_eq!(got.is_episode, Some(true), "{tag}");
         // Every one of these releases predates `client`, so the pre-column row has to be gone:
         // its headers cannot be rebuilt. Checked after the round trip above, which is what
         // proves `None` here means "deleted" and not "the query failed".
         assert!(d.get_stream("old-row", now).is_none(), "{tag}: the stale cache row survived");
 
-        // Checkpoint 3: the user's history and library come through untouched, except the local
-        // play, which `open` removes on purpose (On Repeat excludes local files since 0.3.1).
+        // Checkpoint 3: the user's history and library come through untouched. On Repeat still
+        // leaves out the local play, which moved into `listens` with the rest.
         assert_eq!(d.get_setting("volume").as_deref(), Some("0.42"), "{tag}");
         assert_eq!(d.top_plays(0, 20), vec![(r#"{"yt":1}"#.to_string(), 1)], "{tag}");
         let tracks = d.local_tracks(None);

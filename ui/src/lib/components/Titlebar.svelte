@@ -16,6 +16,7 @@
 		Refresh03Icon,
 		MinusSignIcon,
 		SquareIcon,
+		CopyIcon,
 		Cancel01Icon,
 		MinimizeScreenIcon,
 		CameraVideoIcon,
@@ -23,7 +24,8 @@
 		Loading03Icon,
 		HotspotOfflineIcon,
 		UserGroup02Icon,
-		Link04Icon
+		Link04Icon,
+		Settings02Icon
 	} from '@hugeicons/core-free-icons';
 	import LastFmIcon from './LastFmIcon.svelte';
 	import DiscordIcon from './DiscordIcon.svelte';
@@ -35,6 +37,8 @@
 	import { lt } from '$lib/lt.svelte';
 	import { anchorMenu, fitMenu, NO_ANCHOR } from '$lib/menu';
 	import { t } from '$lib/i18n.svelte';
+	import { connectLastfm, disconnectLastfm, lastfm, watchLastfm } from '$lib/lastfm.svelte';
+	import { watchListenBrainz } from '$lib/listenbrainz.svelte';
 
 	// `w` is this window; `win` (imported) is the shared frame state.
 	const w = getCurrentWindow();
@@ -51,11 +55,11 @@
 		else deepest = depth += 1;
 	});
 
-	// Last.fm connection state. `connecting` is UI-local: set on click, cleared by the
-	// `lastfm-state` event (success, failure, or timeout) — the backend always answers.
-	let connected = $state(false);
-	let username = $state<string | null>(null);
-	let connecting = $state(false);
+	// Last.fm connection state lives in `lastfm.svelte.ts`: the Scrobbling settings tab connects
+	// and disconnects too.
+	const connected = $derived(lastfm.connected);
+	const username = $derived(lastfm.username);
+	const connecting = $derived(lastfm.connecting);
 	let menuOpen = $state(false);
 	let anchor = $state(NO_ANCHOR);
 
@@ -77,26 +81,10 @@
 		}
 	}
 
-	onMount(() => {
-		api.lastfmStatus()
-			.then((s) => {
-				connected = s.connected;
-				username = s.username ?? null;
-			})
-			.catch(() => {});
-		const sub = api.onLastfmState((s) => {
-			const wasConnecting = connecting;
-			connecting = false;
-			connected = s.connected;
-			username = s.username ?? null;
-			if (s.error) toast.error(s.error);
-			else if (s.connected) toast.success(t('integrations.lastfm_scrobbling_as', { user: s.username ?? '' }));
-			else if (!wasConnecting) toast.success(t('integrations.lastfm_disconnected'));
-		});
-		return () => sub.then((u) => u());
-	});
+	onMount(watchLastfm);
+	onMount(watchListenBrainz);
 
-	async function onScrobblerClick(e: MouseEvent) {
+	function onScrobblerClick(e: MouseEvent) {
 		if (connecting) {
 			// A second click cancels the pending browser authorization. The `lastfm-state` event it
 			// triggers clears the spinner (and, arriving while `connecting`, stays toast-silent).
@@ -107,14 +95,7 @@
 			openMenu(e);
 			return;
 		}
-		connecting = true;
-		try {
-			await api.lastfmConnect();
-			toast(t('integrations.lastfm_approve_in_browser'));
-		} catch (err) {
-			connecting = false;
-			toast.error(String(err));
-		}
+		connectLastfm();
 	}
 
 	function openMenu(e: MouseEvent) {
@@ -124,7 +105,14 @@
 
 	function disconnect() {
 		menuOpen = false;
-		api.lastfmDisconnect().catch((e) => toast.error(String(e)));
+		disconnectLastfm();
+	}
+
+	// #327: this menu is where people look for scrobbling settings.
+	function openScrobbleSettings() {
+		menuOpen = false;
+		ui.settingsFocus = 'scrobbling';
+		ui.settingsOpen = true;
 	}
 
 	const scrobblerTitle = $derived(
@@ -137,12 +125,15 @@
 </script>
 
 <!-- `relative` makes this a stacking context, so the account/window dropdowns inside it are capped
-     at this z — it must outrank the panels below (LyricsPanel/QueuePanel, z-30). Theater mode is
+     at this z: it must outrank the panels below (LyricsPanel/QueuePanel, z-30). Theater mode is
      the exception: it sits at z-40 so dialogs (z-50) can open over it, so the bar has to duck
-     under it instead of the other way round. -->
+     under it instead of the other way round. Modal backdrops sit at z-[49], under this bar, so the
+     window can still be dragged and closed with a dialog open (#427). pointer-events-auto because
+     an open dialog sets `pointer-events: none` on <body>; `data-window-control` marks the buttons
+     that don't dismiss it (`onWindowChrome`). -->
 <header
 	data-tauri-drag-region
-	class="relative {ui.theaterOpen ? 'z-0' : 'z-50'} flex h-9 shrink-0 select-none items-center justify-between border-b border-border/60 bg-background"
+	class="pointer-events-auto relative {ui.theaterOpen ? 'z-0' : 'z-50'} flex h-9 shrink-0 select-none items-center justify-between border-b border-border/60 bg-background"
 >
 	<span
 		class="pointer-events-none absolute inset-x-0 text-center text-xs font-medium tracking-wide text-muted-foreground"
@@ -151,7 +142,11 @@
 	</span>
 
 	<!-- macOS overlay style floats the traffic lights over the top-left of the webview, so the row
-	     starts clear of them. 70px is the standard reservation for the three buttons. -->
+	     starts clear of them. `trafficLightPosition` in tauri.macos.conf.json centres them in this
+	     36px bar and insets them 14px (#189); they end near 68px, so 70px plus the logo's margin
+	     leaves about as much space after them as before them. Its `y` is not a top margin: tao
+	     sizes the titlebar to the 16px button plus `y` and the buttons keep their offset from its
+	     bottom, so their centre lands at y + 2 (y: 10 moved them up 2px on a real Mac). -->
 	<div class="flex h-full items-center {win.chrome === 'overlay' ? 'pl-[70px]' : ''}">
 		<!-- pointer-events-none: the logo is decoration; clicks on it should drag the window. -->
 		<img src={appIcon.src} alt="" class="pointer-events-none ml-3 mr-1 h-4 w-4" />
@@ -305,22 +300,38 @@
 		{#if win.chrome === 'off'}
 			<div class="mx-1.5 h-4 w-px bg-border"></div>
 
-			<button
-				class="flex h-full w-11 items-center justify-center text-muted-foreground transition-colors hover:bg-accent/10 hover:text-foreground"
-				onclick={() => w.minimize()}
-				aria-label={t('common.minimize')}
-			>
-				<HugeiconsIcon icon={MinusSignIcon} class="h-4 w-4" />
-			</button>
-			<button
-				class="flex h-full w-11 items-center justify-center text-muted-foreground transition-colors hover:bg-accent/10 hover:text-foreground"
-				onclick={() => w.toggleMaximize()}
-				aria-label={t('common.maximize')}
-			>
-				<HugeiconsIcon icon={SquareIcon} class="h-3.5 w-3.5" />
-			</button>
+			<!-- Minimize and maximize follow the desktop's button layout (#481). -->
+			{#if win.minimize}
+				<button
+					class="flex h-full w-11 items-center justify-center text-muted-foreground transition-colors hover:bg-accent/10 hover:text-foreground"
+					data-window-control
+					onclick={() => w.minimize()}
+					aria-label={t('common.minimize')}
+				>
+					<HugeiconsIcon icon={MinusSignIcon} class="h-4 w-4" />
+				</button>
+			{/if}
+			{#if win.maximize}
+				<button
+					class="flex h-full w-11 items-center justify-center text-muted-foreground transition-colors hover:bg-accent/10 hover:text-foreground"
+					data-window-control
+					onclick={() => w.toggleMaximize()}
+					aria-label={win.maximized ? t('common.restore') : t('common.maximize')}
+				>
+					<!-- Maximized: the restore glyph, two overlapping squares with the front one low-left.
+					     That is CopyIcon turned half a turn. altIcon/showAlt, since `icon` is frozen at
+					     mount (#428). -->
+					<HugeiconsIcon
+						icon={SquareIcon}
+						altIcon={CopyIcon}
+						showAlt={win.maximized}
+						class="h-3.5 w-3.5 {win.maximized ? 'rotate-180' : ''}"
+					/>
+				</button>
+			{/if}
 			<button
 				class="flex h-full w-11 items-center justify-center text-muted-foreground transition-colors hover:text-destructive"
+				data-window-control
 				onclick={() => w.close()}
 				aria-label={t('common.close')}
 			>
@@ -354,6 +365,12 @@
 			</div>
 		</div>
 		<div class="mx-1 my-1 h-px bg-border"></div>
+		<button
+			class="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent/10"
+			onclick={openScrobbleSettings}
+		>
+			<HugeiconsIcon icon={Settings02Icon} class="h-4 w-4" /> {t('integrations.lastfm_settings')}
+		</button>
 		<button
 			class="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm text-destructive hover:bg-destructive/10"
 			onclick={disconnect}
