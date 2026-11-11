@@ -189,7 +189,10 @@ jobs:
           tauri build --bundles nsis \
             --config '{"build":{"beforeBuildCommand":""},"bundle":{"createUpdaterArtifacts":false}}'
 
-      - name: Check the installer exists
+      # Is libmpv-2.dll actually in the installer? Size alone does not answer it: the DLL is 117 MB
+      # on disk and the NSIS payload is LZMA-compressed, so the setup.exe is ~63 MB whether or not
+      # the resource got picked up. Ask the archive instead — 7z reads the NSIS container.
+      - name: Verify the installer (size + bundled libmpv-2.dll)
         shell: bash
         run: |
           set -euo pipefail
@@ -198,11 +201,27 @@ jobs:
             echo "::error::expected installer not found: $EXE"; find target/release/bundle -maxdepth 2; exit 1
           fi
           ls -la "$EXE"
-          # The installer bundles libmpv-2.dll (117 MB), so anything much under ~100 MB means the
-          # resource was not picked up and the app would fail to start after install.
-          SIZE="$(stat -c %s "$EXE")"
-          if [ "$SIZE" -lt 100000000 ]; then
-            echo "::error::installer is only $SIZE bytes — libmpv-2.dll was probably not bundled"; exit 1
+
+          # Both must be present before the bundle step: tauri.windows.conf.json lists libmpv-2.dll
+          # under bundle.resources and reads it from src-tauri/.
+          if [ ! -f src-tauri/libmpv-2.dll ]; then
+            echo "::error::src-tauri/libmpv-2.dll is missing — bundle.resources had nothing to copy"; exit 1
+          fi
+          ls -la src-tauri/libmpv-2.dll
+
+          7z l "$EXE" > listing.txt
+          if ! grep -qi 'libmpv-2\.dll' listing.txt; then
+            echo "::error::libmpv-2.dll is not inside the installer — the app would install and fail to start"
+            grep -iE '\.dll|\.exe' listing.txt | head -20
+            exit 1
+          fi
+          echo "libmpv-2.dll is bundled in the installer:"
+          grep -i 'libmpv-2\.dll' listing.txt
+
+          # The app binary itself has to be in there too, embedded-frontend build (cargo tauri build,
+          # never a bare cargo build).
+          if ! grep -qi 'limusic-app\.exe' listing.txt; then
+            echo "::error::limusic-app.exe is not inside the installer"; exit 1
           fi
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
