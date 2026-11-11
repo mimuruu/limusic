@@ -167,10 +167,32 @@ jobs:
           # it next to the exe. Without this the app builds but will not start.
           Copy-Item "$env:MPV_DIR\libmpv-2.dll" "$env:GITHUB_WORKSPACE\src-tauri\libmpv-2.dll" -Force
 
-      # build.rs reads a gitignored src-tauri/lastfm.keys and uses option_env!, so a build without one
-      # is fully functional, it just reports the scrobbler as "not configured". Upstream keeps the
-      # credentials in their repo's secrets; this fork does not have them, so this build ships without
-      # Last.fm scrobbling.
+      # build.rs reads a gitignored src-tauri/lastfm.keys and bakes its two values in with
+      # option_env!. Without the file the app still builds and runs and the Last.fm button just
+      # reports "not configured" — but the keys are secrets, so they can only arrive here.
+      #
+      # Written as exact bytes with printf (no trailing newline games) and checked afterwards: a
+      # silent failure here would ship an installer that looks fine and has a dead scrobbler, which
+      # is the one outcome this step exists to prevent.
+      - name: Write the Last.fm API keys
+        shell: bash
+        env:
+          LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
+          LASTFM_API_SECRET: ${{ secrets.LASTFM_API_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ -z "${LASTFM_API_KEY:-}" ] || [ -z "${LASTFM_API_SECRET:-}" ]; then
+            echo "::error::LASTFM_API_KEY / LASTFM_API_SECRET are not set on this repo (Settings ▸ Secrets and variables ▸ Actions). Add them, or remove this step if you want a build without Last.fm."
+            exit 1
+          fi
+          printf 'LIMUSIC_LASTFM_API_KEY=%s\nLIMUSIC_LASTFM_API_SECRET=%s\n' \
+            "$LASTFM_API_KEY" "$LASTFM_API_SECRET" > src-tauri/lastfm.keys
+          # Confirm build.rs will actually pick both lines up: it only exports keys named exactly
+          # LIMUSIC_LASTFM_API_KEY / LIMUSIC_LASTFM_API_SECRET.
+          [ "$(grep -c '^LIMUSIC_LASTFM_API_KEY=' src-tauri/lastfm.keys)" = 1 ] || { echo "::error::key line missing"; exit 1; }
+          [ "$(grep -c '^LIMUSIC_LASTFM_API_SECRET=' src-tauri/lastfm.keys)" = 1 ] || { echo "::error::secret line missing"; exit 1; }
+          echo "lastfm.keys written ($(wc -l < src-tauri/lastfm.keys) lines)"
+
       - name: Build the installer (unsigned)
         shell: bash
         run: |
@@ -194,6 +216,8 @@ jobs:
       # the resource got picked up. Ask the archive instead — 7z reads the NSIS container.
       - name: Verify the installer (size + bundled libmpv-2.dll)
         shell: bash
+        env:
+          LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
         run: |
           set -euo pipefail
           EXE="target/release/bundle/nsis/limusic_${VERSION}_x64-setup.exe"
@@ -223,6 +247,18 @@ jobs:
           if ! grep -qi 'limusic-app\.exe' listing.txt; then
             echo "::error::limusic-app.exe is not inside the installer"; exit 1
           fi
+
+          # End-to-end proof that the keys were actually baked in, not just written to a file that
+          # build.rs never read: the literal API key lives in the compiled binary's rodata. Checked
+          # against the un-bundled exe, because the NSIS payload is compressed.
+          if [ ! -f target/release/limusic-app.exe ]; then
+            echo "::error::target/release/limusic-app.exe not found"; exit 1
+          fi
+          if ! grep -c --text "$LASTFM_API_KEY" target/release/limusic-app.exe > /dev/null; then
+            echo "::error::the Last.fm API key is not baked into limusic-app.exe — build.rs did not read lastfm.keys"
+            exit 1
+          fi
+          echo "Last.fm API key is baked into limusic-app.exe"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
